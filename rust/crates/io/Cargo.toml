@@ -1,0 +1,20 @@
+# openspd-io — transporte de ESCRITORIO: lee del encoder por TCP (v1/WiFi) y BLE (v2) y emite
+# repeticiones por canales mpsc. Aquí viven tokio y bluer; los binarios de UI no los tocan.
+# En móvil este crate NO se usa: Android/iOS hacen el TCP/BLE nativo y llaman a openspd-core.
+[package]
+name = "openspd-io"
+description = "OpenSPD — adaptadores de transporte de escritorio (TCP/BLE) sobre openspd-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "openspd_io"
+
+[dependencies]
+openspd-core = { workspace = true }
+tokio = { workspace = true }
+bluer = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }

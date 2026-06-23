@@ -8,9 +8,11 @@
 //!   1RM (kg)   = (V1RM - a) / b
 //!   %1RM(v)    = 100·(a - v)/(a - V1RM)     (=100 cuando v=V1RM, =0 cuando v=a)
 //! Es individual: mucho mas preciso que las ecuaciones poblacionales de metrics.rs.
-
-use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+//!
+//! La persistencia es PURA: [`Lvp::to_text`] serializa a texto y [`Lvp::from_text`] reconstruye
+//! (re-ajustando). Este crate NO toca el filesystem; quien quiera leer/escribir ficheros
+//! (escritorio) envuelve esto con `File` (ver `openspd-io`), y en móvil se persiste el `String`
+//! con los medios de la plataforma.
 
 /// Un punto del perfil: una carga y la mejor velocidad media lograda a esa carga.
 #[derive(Debug, Clone, Copy)]
@@ -106,43 +108,44 @@ impl Lvp {
     }
 }
 
-/// Guarda el perfil (ejercicio, v1rm y puntos). Al cargar se re-ajusta.
-pub fn save(path: &str, lvp: &Lvp) -> std::io::Result<()> {
-    let mut f = File::create(path)?;
-    writeln!(f, "exercise={}", lvp.exercise)?;
-    writeln!(f, "v1rm={}", lvp.v1rm)?;
-    writeln!(f, "# load_kg,best_velocity")?;
-    for p in &lvp.points {
-        writeln!(f, "{},{}", p.load_kg, p.best_velocity)?;
-    }
-    Ok(())
-}
-
-/// Carga un perfil guardado y lo re-ajusta.
-pub fn load(path: &str) -> std::io::Result<Lvp> {
-    let f = File::open(path)?;
-    let mut exercise = String::from("custom");
-    let mut v1rm = 0.30;
-    let mut points = Vec::new();
-    for line in BufReader::new(f).lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+impl Lvp {
+    /// Serializa el perfil (ejercicio, v1rm y puntos) a texto. Al reconstruir se re-ajusta.
+    /// Puro: no toca el filesystem. El escritorio lo escribe a un `.lvp`; móvil lo guarda donde
+    /// quiera.
+    pub fn to_text(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("exercise={}\n", self.exercise));
+        s.push_str(&format!("v1rm={}\n", self.v1rm));
+        s.push_str("# load_kg,best_velocity\n");
+        for p in &self.points {
+            s.push_str(&format!("{},{}\n", p.load_kg, p.best_velocity));
         }
-        if let Some(v) = line.strip_prefix("exercise=") {
-            exercise = v.to_string();
-        } else if let Some(v) = line.strip_prefix("v1rm=") {
-            v1rm = v.trim().parse().unwrap_or(0.30);
-        } else if let Some((l, vel)) = line.split_once(',') {
-            if let (Ok(l), Ok(vel)) = (l.trim().parse(), vel.trim().parse()) {
-                points.push(Point { load_kg: l, best_velocity: vel });
+        s
+    }
+
+    /// Reconstruye un perfil desde el texto de [`Lvp::to_text`], re-ajustando la recta.
+    /// Devuelve `None` si no hay >=2 cargas válidas. Puro: no toca el filesystem.
+    pub fn from_text(text: &str) -> Option<Lvp> {
+        let mut exercise = String::from("custom");
+        let mut v1rm = 0.30;
+        let mut points = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("exercise=") {
+                exercise = v.to_string();
+            } else if let Some(v) = line.strip_prefix("v1rm=") {
+                v1rm = v.trim().parse().unwrap_or(0.30);
+            } else if let Some((l, vel)) = line.split_once(',') {
+                if let (Ok(l), Ok(vel)) = (l.trim().parse(), vel.trim().parse()) {
+                    points.push(Point { load_kg: l, best_velocity: vel });
+                }
             }
         }
+        fit(&exercise, points, v1rm)
     }
-    fit(&exercise, points, v1rm).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "perfil con <2 cargas validas")
-    })
 }
 
 #[cfg(test)]
@@ -165,5 +168,26 @@ mod tests {
         assert!(lvp.is_valid());
         // a 60 kg -> v=0.9 -> %1RM = 60/120 = 50%
         assert!((lvp.pct_1rm(0.90) - 50.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn texto_round_trip() {
+        let pts = vec![
+            Point { load_kg: 40.0, best_velocity: 1.10 },
+            Point { load_kg: 60.0, best_velocity: 0.90 },
+            Point { load_kg: 80.0, best_velocity: 0.70 },
+        ];
+        let lvp = fit("sentadilla", pts, 0.30).unwrap();
+        let back = Lvp::from_text(&lvp.to_text()).unwrap();
+        assert_eq!(back.exercise, "sentadilla");
+        assert!((back.v1rm - 0.30).abs() < 1e-9);
+        assert_eq!(back.points.len(), 3);
+        // re-ajustar desde el texto reproduce el mismo 1RM
+        assert!((back.one_rm_kg - lvp.one_rm_kg).abs() < 1e-6);
+    }
+
+    #[test]
+    fn from_text_rechaza_pocos_puntos() {
+        assert!(Lvp::from_text("exercise=banca\nv1rm=0.17\n40,0.5\n").is_none());
     }
 }

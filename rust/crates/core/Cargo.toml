@@ -1,0 +1,17 @@
+# openspd-core — lógica de dominio PURA: protocolo, métricas VBT, perfil carga-velocidad y
+# descifrado/parse del encoder v2 (BLE). Sin sockets, sin tokio, sin UI, sin filesystem.
+# Es el crate que se compila a Android/iOS (vía openspd-ffi).
+[package]
+name = "openspd-core"
+description = "OpenSPD — núcleo VBT reutilizable (protocolo, métricas, perfil, cripto v2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "openspd_core"
+
+[dependencies]
+aes = { workspace = true }
+rand = { workspace = true }

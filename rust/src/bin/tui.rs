@@ -13,11 +13,8 @@
 //!   openspd-tui --exercise sentadilla --load 40
 //!   openspd-tui --profile sentadilla.lvp        (carga un perfil existente para seguir)
 
-use std::collections::HashSet;
 use std::io;
-use std::net::TcpStream;
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -27,15 +24,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 
-use openspd::encoderv2;
-use openspd::profile::{self, default_v1rm, Lvp, Point};
-use openspd::protocol::{parse_line, Rep, ENCODER_HOST, ENCODER_PORT};
-
-enum Msg {
-    Status(String),
-    Rep(Rep),
-    Closed,
-}
+use openspd_core::metrics::velocity_loss;
+use openspd_core::profile::{self, default_v1rm, Lvp, Point};
+use openspd_core::protocol::{Rep, ENCODER_HOST, ENCODER_PORT};
+use openspd_io::RepEvent;
 
 struct App {
     exercise: String,
@@ -54,7 +46,7 @@ struct App {
     msg: String,
     quit: bool,
     // conexión (None = pantalla de selección de encoder)
-    rx: Option<Receiver<Msg>>,
+    rx: Option<Receiver<RepEvent>>,
     scanning: bool,
     scan_rx: Option<Receiver<Result<Vec<(String, String)>, String>>>,
     scan_results: Vec<(String, String)>,
@@ -89,13 +81,13 @@ impl App {
         self.current_set.push(rep);
         self.log.push((self.set_idx, rep, now_unix()));
         self.last_rep = Some(Instant::now());
-        let _ = save_csv(&self.csv_path, &self.log);
+        let _ = openspd_io::save_session_csv(&self.csv_path, &self.log);
     }
 
     fn save_all(&mut self) {
-        let _ = save_csv(&self.csv_path, &self.log);
+        let _ = openspd_io::save_session_csv(&self.csv_path, &self.log);
         if let Some(lvp) = &self.lvp {
-            match profile::save(&self.profile_path, lvp) {
+            match openspd_io::save_profile(&self.profile_path, lvp) {
                 Ok(_) => self.msg = format!("Guardado: {} y {}", self.csv_path, self.profile_path),
                 Err(e) => self.msg = format!("Error guardando perfil: {e}"),
             }
@@ -119,181 +111,6 @@ impl App {
 
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
-
-fn save_csv(path: &str, log: &[(u32, Rep, u64)]) -> io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
-    writeln!(f, "set,rep,vel_media_mps,rom_cm,vel_maxima_mps,t_unix")?;
-    for (set, r, t) in log {
-        writeln!(f, "{},{},{},{},{},{}", set, r.rep, r.mean_velocity, r.rom, r.peak_velocity, t)?;
-    }
-    Ok(())
-}
-
-fn velocity_loss(reps: &[Rep]) -> f64 {
-    if reps.is_empty() {
-        return 0.0;
-    }
-    let best = reps.iter().map(|r| r.mean_velocity).fold(f64::MIN, f64::max);
-    if best <= 0.0 {
-        return 0.0;
-    }
-    (best - reps.last().unwrap().mean_velocity) / best * 100.0
-}
-
-fn spawn_reader(host: String, port: u16) -> Receiver<Msg> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(Msg::Status(format!("conectando a {host}:{port}…")));
-        let stream = match TcpStream::connect((host.as_str(), port)) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = tx.send(Msg::Status(format!("ERROR de red: {e} (¿wifi al encoder?)")));
-                return;
-            }
-        };
-        let _ = tx.send(Msg::Status("conectado · esperando reps".into()));
-        use std::io::{BufRead, BufReader};
-        let reader = BufReader::new(stream);
-        for line in reader.lines() {
-            match line {
-                Ok(l) => {
-                    if let Some(rep) = parse_line(&l) {
-                        if tx.send(Msg::Rep(rep)).is_err() {
-                            return;
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = tx.send(Msg::Closed);
-    });
-    rx
-}
-
-/// Escanea encoders v2 (BLE) en un hilo con runtime propio. Devuelve (dirección, etiqueta).
-fn spawn_ble_scan() -> Receiver<Result<Vec<(String, String)>, String>> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.send(Err(e.to_string()));
-                return;
-            }
-        };
-        let res = rt.block_on(async {
-            use futures::StreamExt;
-            let service: uuid::Uuid = encoderv2::SERVICE_UUID.parse().map_err(|_| "uuid".to_string())?;
-            let session = bluer::Session::new().await.map_err(|e| e.to_string())?;
-            let adapter = session.default_adapter().await.map_err(|e| e.to_string())?;
-            adapter.set_powered(true).await.map_err(|e| e.to_string())?;
-            let mut disc = adapter.discover_devices().await.map_err(|e| e.to_string())?;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
-            let mut seen: HashSet<bluer::Address> = HashSet::new();
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(deadline) => break,
-                    Some(ev) = disc.next() => {
-                        if let bluer::AdapterEvent::DeviceAdded(a) = ev { seen.insert(a); }
-                    }
-                    else => break,
-                }
-            }
-            let mut out = Vec::new();
-            for addr in seen {
-                if let Ok(dev) = adapter.device(addr) {
-                    let uuids = dev.uuids().await.ok().flatten().unwrap_or_default();
-                    if uuids.contains(&service) {
-                        out.push((addr.to_string(), format!("encoderv2 [{addr}]")));
-                    }
-                }
-            }
-            Ok::<_, String>(out)
-        });
-        let _ = tx.send(res);
-    });
-    rx
-}
-
-async fn ble_char(
-    dev: &bluer::Device,
-    uuid_str: &str,
-) -> Option<bluer::gatt::remote::Characteristic> {
-    let want: uuid::Uuid = uuid_str.parse().ok()?;
-    for s in dev.services().await.ok()? {
-        for c in s.characteristics().await.ok()? {
-            if c.uuid().await.ok()? == want {
-                return Some(c);
-            }
-        }
-    }
-    None
-}
-
-/// Conecta a un encoder v2 (BLE) por dirección, desbloquea, se suscribe y emite Reps (fase
-/// concéntrica) por el canal. Hilo con runtime propio.
-fn spawn_ble_reader(addr: String) -> Receiver<Msg> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.send(Msg::Status(e.to_string()));
-                return;
-            }
-        };
-        rt.block_on(async move {
-            use futures::StreamExt;
-            let run = async {
-                let _ = tx.send(Msg::Status(format!("conectando (v2) a {addr}…")));
-                let session = bluer::Session::new().await?;
-                let adapter = session.default_adapter().await?;
-                adapter.set_powered(true).await?;
-                let address: bluer::Address = addr.parse().map_err(|_| "dirección inválida")?;
-                let device = adapter.device(address)?;
-                if !device.is_connected().await? {
-                    device.connect().await?;
-                }
-                for _ in 0..50 {
-                    if device.is_services_resolved().await? {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                let key = encoderv2::generate_key();
-                let unlock = ble_char(&device, encoderv2::CHAR_UNLOCK).await.ok_or("falta unlock")?;
-                unlock.write(&key.unlock_bytes).await?;
-                let rep_char = ble_char(&device, encoderv2::CHAR_REPETITION).await.ok_or("falta rep")?;
-                if let Some(be) = ble_char(&device, encoderv2::CHAR_BEGIN_END).await {
-                    let _ = be.write(encoderv2::begin_command(20, false, 'P').as_bytes()).await;
-                }
-                let _ = tx.send(Msg::Status("conectado (v2) · esperando reps".into()));
-                let notifs = rep_char.notify().await?;
-                tokio::pin!(notifs);
-                let mut reasm = encoderv2::Reassembler::new(key.aes_key);
-                while let Some(val) = notifs.next().await {
-                    for msg in reasm.push(&val) {
-                        if let Some(rep) = encoderv2::parse_repetition(&msg) {
-                            if rep.phase == encoderv2::Phase::Concentric
-                                && tx.send(Msg::Rep(rep.to_rep())).is_err()
-                            {
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-                Ok::<(), Box<dyn std::error::Error>>(())
-            };
-            if let Err(e) = run.await {
-                let _ = tx.send(Msg::Status(format!("error v2: {e}")));
-            }
-            let _ = tx.send(Msg::Closed);
-        });
-    });
-    rx
 }
 
 struct Args {
@@ -331,7 +148,7 @@ fn parse_args() -> Args {
             "--csv" => csv = it.next(),
             "--profile" => {
                 if let Some(p) = it.next() {
-                    if let Ok(l) = profile::load(&p) {
+                    if let Ok(l) = openspd_io::load_profile(&p) {
                         exercise = l.exercise.clone();
                         loaded = Some(l);
                     }
@@ -429,9 +246,9 @@ fn run<B: ratatui::backend::Backend>(
             }
             for m in incoming {
                 match m {
-                    Msg::Rep(rep) => app.add_rep(rep),
-                    Msg::Status(s) => app.status = s,
-                    Msg::Closed => app.status = "conexión cerrada por el encoder".into(),
+                    RepEvent::Rep(rep) => app.add_rep(rep),
+                    RepEvent::Status(s) => app.status = s,
+                    RepEvent::Closed => app.status = "conexión cerrada por el encoder".into(),
                 }
             }
             // fin de serie por descanso
@@ -478,20 +295,20 @@ fn run<B: ratatui::backend::Backend>(
                         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
                         KeyCode::Char('w') => {
                             app.status = "conectando (v1 WiFi)…".into();
-                            app.rx = Some(spawn_reader(ENCODER_HOST.to_string(), ENCODER_PORT));
+                            app.rx = Some(openspd_io::spawn_tcp_reader(ENCODER_HOST.to_string(), ENCODER_PORT));
                         }
                         KeyCode::Char('e') if !app.scanning => {
                             app.scanning = true;
                             app.scan_results.clear();
                             app.msg = "buscando encoders v2 (≈6 s)…".into();
-                            app.scan_rx = Some(spawn_ble_scan());
+                            app.scan_rx = Some(openspd_io::spawn_ble_scan(openspd_io::DEFAULT_SCAN_SECS));
                         }
                         KeyCode::Char(d) if d.is_ascii_digit() => {
                             let n = d.to_digit(10).unwrap() as usize;
                             if n >= 1 && n <= app.scan_results.len() {
                                 let addr = app.scan_results[n - 1].0.clone();
                                 app.status = format!("conectando (v2) a {addr}…");
-                                app.rx = Some(spawn_ble_reader(addr));
+                                app.rx = Some(openspd_io::spawn_ble_reader(addr));
                             }
                         }
                         _ => {}
