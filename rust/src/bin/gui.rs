@@ -379,16 +379,31 @@ impl GuiApp {
         });
     }
 
-    fn top_bar(&self, ctx: &egui::Context) {
+    fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("OpenSPD");
+                if ui.button("⟵ Cambiar encoder").clicked() {
+                    self.disconnect_to_select();
+                }
                 ui.separator();
                 ui.label(format!("Serie {}", self.set_idx));
                 ui.separator();
-                ui.label(egui::RichText::new(&self.status).color(egui::Color32::LIGHT_BLUE));
+                ui.label(egui::RichText::new(self.status.clone()).color(egui::Color32::LIGHT_BLUE));
             });
         });
+    }
+
+    /// Cierra la conexión actual y vuelve a la pantalla de selección de encoder.
+    fn disconnect_to_select(&mut self) {
+        self.rx = None; // al soltar el Receiver, el hilo lector termina en su próximo envío
+        self.current_set.clear();
+        self.last_rep = None;
+        self.scanning = false;
+        self.scan_rx = None;
+        self.scan_results.clear();
+        self.status = "elige un encoder".into();
+        self.msg = "Desconectado. Elige un encoder. (El perfil y las series guardadas se conservan.)".into();
     }
 
     fn controls(&mut self, ctx: &egui::Context) {
