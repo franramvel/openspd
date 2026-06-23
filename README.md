@@ -1,4 +1,4 @@
-# OpenSPD — ingeniería inversa + app propia
+# OpenSPD — cliente abierto (ingeniería inversa) para encoders VBT
 
 Cliente abierto y multi-encoder para encoders VBT de terceros, por ingeniería inversa para
 interoperabilidad:
@@ -11,9 +11,10 @@ OpenSPD es software independiente, sin relación ni respaldo de los fabricantes 
 NetworkManager/`nmcli`, y el encoder v2 usa BlueZ/`libdbus`). En Windows/macOS el bloque de `nmcli`
 no aplica tal cual.
 
-**Dispositivos probados:** encoder VBT de **1ª generación, solo WiFi** (el v1), y un encoder **BLE**
-(el v2) — ambos **que ya posees**. ⚠️ Los modelos comerciales **actuales** (p. ej. el "Force") son
-hardware distinto y casi seguro **otro protocolo**: no asumas compatibilidad si compras uno nuevo.
+**Dispositivos probados:** un encoder VBT de **1ª generación, solo WiFi** (el v1) y un encoder **BLE**
+(el v2), ambos en posesión del autor del proyecto. ⚠️ Los modelos comerciales **actuales** (p. ej. el
+"Force") son hardware distinto y casi seguro **otro protocolo**: no des por hecha la compatibilidad
+con un equipo nuevo.
 
 > ⚠️ **Seguridad / entrenamiento:** OpenSPD estima %1RM y avisa de fatiga (velocity loss) sobre los
 > que vas a cargar peso real. Las estimaciones son **orientativas**, **no** sustituyen la supervisión
@@ -21,8 +22,9 @@ hardware distinto y casi seguro **otro protocolo**: no asumas compatibilidad si 
 
 ## 1. Red: conectarse al encoder SIN perder internet (Linux + NetworkManager)
 
-El PC tiene internet por cable (`enp5s0`). Conectamos el WiFi (`wlan0`) al encoder pero le
-impedimos tomar la ruta por defecto, así internet sigue saliendo por el cable:
+Ejemplo con un PC que tiene internet por cable (`enp5s0`) y WiFi (`wlan0`): se conecta el WiFi al
+encoder pero se le impide tomar la ruta por defecto, así internet sigue saliendo por el cable
+(ajusta los nombres de interfaz a los de tu equipo):
 
 ```bash
 nmcli dev wifi connect "Speed4lifts_167" password "123456789" ifname wlan0

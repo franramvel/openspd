@@ -16,8 +16,8 @@ empresas matrices, filiales, propietarios o distribuidores.
 
 OpenSPD se ha desarrollado mediante **ingeniería inversa con fines de interoperabilidad** y uso
 personal/educativo: permite que el propietario de su encoder lea los datos que el dispositivo emite
-en su propia red WiFi. No incluye, copia ni redistribuye firmware, código ni recursos del
-fabricante.
+(por WiFi o Bluetooth LE) desde un programa creado de forma independiente. No incluye, copia ni
+redistribuye firmware, código ni recursos del fabricante.
 
 ## Sin garantía
 
