@@ -1,0 +1,32 @@
+[package]
+name = "openspd"
+version = "0.1.0"
+edition = "2021"
+description = "OpenSPD — grabadora VBT para encoder de 1a gen (WiFi)"
+license = "GPL-3.0-or-later"
+authors = ["OpenSPD contributors"]
+
+[lib]
+name = "openspd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openspd"
+path = "src/main.rs"
+
+[[bin]]
+name = "openspd-tui"
+path = "src/bin/tui.rs"
+
+[[bin]]
+name = "openspd-gui"
+path = "src/bin/gui.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+eframe = "0.29"
+egui_plot = "0.29"
+
+[profile.release]
+opt-level = 3
