@@ -50,7 +50,7 @@ rep rápida/larga → `@4*1.55#55.77$2.06&` (velocidades suben, ROM sube, pico >
 
 | Archivo              | Qué hace |
 |----------------------|----------|
-| `rust/src/protocol.rs` | Parser del formato (con tests). **Se porta casi 1:1 a Kotlin.** |
+| `rust/src/protocol.rs` | Parser del formato (con tests). |
 | `rust/src/metrics.rs`  | Métricas VBT: velocity loss, resumen, %1RM, zonas de carga. |
 | `rust/src/main.rs`     | App en vivo: reps + VL%, detección de series por descanso, CSV. |
 
@@ -104,16 +104,7 @@ Construye el perfil igual que el TUI (varias cargas → puntos → ajuste). Prob
 muerto) calcula tu **1RM real** y el **%1RM** de cualquier velocidad. Individual = mucho más
 preciso que las ecuaciones poblacionales. Reúsalo en el CLI con `openspd --profile sentadilla.lvp`.
 
-## 4. Port a Kotlin (Android)
-
-- WiFi del móvil al AP del encoder. Para que Android no descarte la red por "no tiene
-  internet", usar `ConnectivityManager.requestNetwork()` con
-  `NetworkCapabilities` y enlazar el socket a esa red (`Network.getSocketFactory()` /
-  `network.bindSocket()`).
-- Abrir `Socket("192.168.4.1", 80)`, leer líneas e idéntica regex que `protocol.py`:
-  `Regex("@(\\d+)\\*([-\\d.]+)#([-\\d.]+)\\$([-\\d.]+)&")`.
-
-## 5. Licencia y aviso legal
+## 4. Licencia y aviso legal
 
 OpenSPD se distribuye bajo la **GNU General Public License v3 o posterior** (`GPL-3.0-or-later`).
 Texto completo en [`LICENSE`](./LICENSE).

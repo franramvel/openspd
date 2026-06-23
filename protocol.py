@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 OpenSPD contributors
 """
-Protocolo del encoder VBT (1a gen, WiFi)  ---  REFERENCIA PARA EL PORT A KOTLIN.
+Protocolo del encoder VBT (1a gen, WiFi).
 
 Descubierto por ingenieria inversa y CONFIRMADO contra la pantalla del encoder:
 
@@ -16,9 +16,6 @@ Descubierto por ingenieria inversa y CONFIRMADO contra la pantalla del encoder:
         vel_media   = 1.55      velocidad media de la rep   (m/s)
         rom         = 55.77     recorrido / range of motion (cm)
         vel_maxima  = 2.06      velocidad pico de la rep    (m/s)  (siempre > media)
-
-Equivalente Kotlin (regex identica):
-    val LINE = Regex("@(\\d+)\\*([-\\d.]+)#([-\\d.]+)\\$([-\\d.]+)&")
 """
 from __future__ import annotations
 from dataclasses import dataclass
