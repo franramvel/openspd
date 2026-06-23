@@ -40,10 +40,16 @@ Comprobar: `ip route` debe seguir mostrando la `default` por el cable; el encode
 
 ## 2. Protocolo (decodificado y confirmado contra la pantalla del encoder)
 
-> **No hay nada cifrado aquí: es texto plano.** El encoder usa el **puerto 80 pero NO habla HTTP** —
-> es un **stream TCP propietario** que emite ASCII crudo. Un cliente HTTP normal fallará; hay que
-> abrir un socket TCP y leer líneas. OpenSPD solo **decodifica/documenta** ese formato abierto
-> (interoperabilidad), no rompe ninguna protección.
+> **Esto es el encoder v1, y aquí no hay nada cifrado: es texto plano.** El encoder usa el
+> **puerto 80 pero NO habla HTTP** — es un **stream TCP propietario** que emite ASCII crudo. Un
+> cliente HTTP normal fallará; hay que abrir un socket TCP y leer líneas. Para el v1, OpenSPD solo
+> **decodifica/documenta** ese formato abierto: no existe ninguna medida tecnológica de protección
+> que sortear.
+>
+> El **encoder v2 (BLE) es un caso distinto**: su stream sí va cifrado y, para interoperar, hay que
+> descifrarlo (ver §4). Eso se hace **conscientemente al amparo de la excepción de ingeniería
+> inversa para interoperabilidad** —sobre un dispositivo de tu propiedad, con software independiente
+> y sin redistribuir nada del fabricante— según se detalla en §5. No lo escondemos: lo enmarcamos.
 
 - Solo el **puerto 80/TCP** está abierto.
 - No responde a HTTP/WebSocket. Nada más conectarte por TCP, **empuja** una línea ASCII
@@ -66,19 +72,26 @@ Ejemplo real `@4*1.55#55.77$2.06&`:
 Validado con 2 reps controladas: rep lenta/corta → `@3*0.26#45.95$0.38&`,
 rep rápida/larga → `@4*1.55#55.77$2.06&` (velocidades suben, ROM sube, pico > media).
 
-## 3. La app de PC — Rust (`rust/`, sin dependencias externas)
+## 3. La app de PC — Rust (workspace `rust/`)
 
-| Archivo              | Qué hace |
-|----------------------|----------|
-| `rust/src/protocol.rs` | Parser del formato (con tests). |
-| `rust/src/metrics.rs`  | Métricas VBT: velocity loss, resumen, %1RM, zonas de carga. |
-| `rust/src/main.rs`     | App en vivo: reps + VL%, detección de series por descanso, CSV. |
+El crate está organizado como un **workspace** que separa el núcleo (lógica pura, reutilizable
+incluso en móvil) del transporte y de la interfaz:
+
+| Crate | Qué hace |
+|-------|----------|
+| `crates/core` (`openspd-core`) | Dominio **puro**: parser del protocolo, métricas VBT (velocity loss, resumen, %1RM, zonas), perfil carga-velocidad y cripto del v2. Sin red ni UI; con tests. |
+| `crates/io` (`openspd-io`) | Transporte de escritorio: lectura TCP (v1) y BLE (v2) y persistencia CSV/perfil. |
+| `crates/ffi` (`openspd-ffi`) | Bindings (uniffi) que exponen el core a **Kotlin (Android) y Swift (iOS)** para apps móviles nativas — ver [`crates/ffi/README.md`](./rust/crates/ffi/README.md). |
+| raíz (`openspd-desktop`) | Los binarios de UI: `openspd` (CLI), `openspd-tui`, `openspd-gui`, `openspd-ble`. |
+
+En móvil, la app nativa hace el TCP/BLE de la plataforma y delega en `openspd-core` el parsing, el
+descifrado del v2, las métricas y el perfil; así la lógica vive en un solo sitio.
 
 ```bash
 cd rust
-cargo test                    # tests del parser
-cargo build --release         # binario en target/release/openspd
-cargo run --release -- --exercise sentadilla --load 80 --vl-stop 20
+cargo test --workspace        # tests (parser, métricas, perfil, cripto v2)
+cargo build --release         # binarios en target/release/ (openspd, openspd-tui, …)
+cargo run --release --bin openspd -- --exercise sentadilla --load 80 --vl-stop 20
 ```
 
 Opciones: `--exercise banca|sentadilla` y `--load KG` (estima %1RM/1RM),
@@ -156,3 +169,21 @@ Texto completo en [`LICENSE`](./LICENSE).
 relacionado con Speed4lifts ni con Vitruve.** Las marcas pertenecen a sus titulares y se citan solo
 de forma nominativa para indicar compatibilidad. Las métricas (incl. %1RM/1RM) son orientativas y
 sin garantía. Ver [`DISCLAIMER.md`](./DISCLAIMER.md).
+
+**Encuadre: ingeniería inversa para interoperabilidad.** Este proyecto se desarrolla al amparo de
+la excepción de interoperabilidad del derecho de autor —en México, el **artículo 114 Quáter,
+fracción I**, de la Ley Federal del Derecho de Autor, con figuras análogas en otras jurisdicciones—,
+sobre las siguientes bases:
+
+- El dispositivo fue **adquirido legalmente y es propiedad** de quien lo usa.
+- El **único propósito** es lograr la **interoperabilidad** de un programa **creado de forma
+  independiente** (OpenSPD) con ese encoder.
+- Es **ingeniería inversa de buena fe y sin ánimo de lucro**, realizada observando el comportamiento
+  de un dispositivo propio.
+- **No se redistribuye** firmware, claves ni código del fabricante: este repositorio contiene solo
+  código original propio y la documentación del formato observado.
+
+> ⚠️ El punto más sensible es **publicar el código de descifrado del encoder v2** (§4): es donde la
+> cobertura de la excepción es menos explícita. Lo anterior es **orientación general, no asesoría
+> legal**; antes de hacer público ese módulo conviene consultarlo con un especialista en propiedad
+> intelectual en tu jurisdicción.
