@@ -1,8 +1,23 @@
 # OpenSPD — ingeniería inversa + app propia
 
-Cliente abierto para un **encoder VBT de 1ª generación (solo WiFi)** de terceros. El dispositivo
-es su propio punto de acceso WiFi y transmite las repeticiones por un socket TCP en texto plano.
-OpenSPD es software independiente, sin relación ni respaldo del fabricante del encoder.
+Cliente abierto y multi-encoder para encoders VBT de terceros, por ingeniería inversa para
+interoperabilidad:
+- **encoder v1** (WiFi): es su propio AP y transmite las repeticiones por un socket TCP en texto plano.
+- **encoder v2** (BLE): stream cifrado (AES-128-ECB) por Bluetooth LE; ver §4.
+
+OpenSPD es software independiente, sin relación ni respaldo de los fabricantes de los encoders.
+
+**Requisitos:** toolchain de **Rust** (`cargo`). Probado en **Linux** (los comandos de red usan
+NetworkManager/`nmcli`, y el encoder v2 usa BlueZ/`libdbus`). En Windows/macOS el bloque de `nmcli`
+no aplica tal cual.
+
+**Dispositivos probados:** encoder VBT de **1ª generación, solo WiFi** (el v1), y un encoder **BLE**
+(el v2) — ambos **que ya posees**. ⚠️ Los modelos comerciales **actuales** (p. ej. el "Force") son
+hardware distinto y casi seguro **otro protocolo**: no asumas compatibilidad si compras uno nuevo.
+
+> ⚠️ **Seguridad / entrenamiento:** OpenSPD estima %1RM y avisa de fatiga (velocity loss) sobre los
+> que vas a cargar peso real. Las estimaciones son **orientativas**, **no** sustituyen la supervisión
+> de un profesional, y entrenas **bajo tu propia responsabilidad**. Sin garantía (ver `DISCLAIMER.md`).
 
 ## 1. Red: conectarse al encoder SIN perder internet (Linux + NetworkManager)
 
@@ -23,7 +38,12 @@ nmcli con up "Speed4lifts_167"
 Comprobar: `ip route` debe seguir mostrando la `default` por el cable; el encoder queda en
 `192.168.4.1` y el PC recibe `192.168.4.x`.
 
-## 2. Protocolo (descifrado y confirmado contra la pantalla del encoder)
+## 2. Protocolo (decodificado y confirmado contra la pantalla del encoder)
+
+> **No hay nada cifrado aquí: es texto plano.** El encoder usa el **puerto 80 pero NO habla HTTP** —
+> es un **stream TCP propietario** que emite ASCII crudo. Un cliente HTTP normal fallará; hay que
+> abrir un socket TCP y leer líneas. OpenSPD solo **decodifica/documenta** ese formato abierto
+> (interoperabilidad), no rompe ninguna protección.
 
 - Solo el **puerto 80/TCP** está abierto.
 - No responde a HTTP/WebSocket. Nada más conectarte por TCP, **empuja** una línea ASCII
@@ -104,7 +124,30 @@ Construye el perfil igual que el TUI (varias cargas → puntos → ajuste). Prob
 muerto) calcula tu **1RM real** y el **%1RM** de cualquier velocidad. Individual = mucho más
 preciso que las ecuaciones poblacionales. Reúsalo en el CLI con `openspd --profile sentadilla.lvp`.
 
-## 4. Licencia y aviso legal
+## 4. Encoder v2 (BLE, datos cifrados) — `openspd-ble`
+
+OpenSPD también soporta un encoder **v2** que se comunica por **Bluetooth LE** con el stream
+**cifrado (AES-128-ECB)**. El cliente genera una llave de sesión, la escribe en la característica
+de desbloqueo nada más conectar (si no, el encoder corta la conexión a los ~3 s), y descifra las
+repeticiones con los primeros 16 bytes de esa llave.
+
+```bash
+cargo run --release --bin openspd-ble                 # escanea y SELECTOR de encoders
+cargo run --release --bin openspd-ble -- --address AA:BB:CC:DD:EE:FF
+```
+
+- **Selector**: escanea y lista los encoders disponibles (los v2 se detectan por su UUID de
+  servicio); eliges uno por número. `--address` conecta directo.
+- Cada repetición trae: nº, **fase concéntrica/excéntrica**, velocidad media propulsiva, ROM,
+  velocidad pico, velocidad media y aceleraciones. Se reutilizan las mismas métricas (velocity
+  loss, zonas) y se guarda CSV.
+- Transporte vía **BlueZ (`bluer`)**. Módulo `encoderv2.rs` (llave + AES + parser) con tests que
+  validan el descifrado sobre datos reales. Requiere `libdbus`/BlueZ (Linux).
+
+> Nota: si el encoder v2 está conectado a otro central (p. ej. tu móvil), libéralo primero (apaga
+> el Bluetooth del teléfono); BLE solo admite un central a la vez.
+
+## 5. Licencia y aviso legal
 
 OpenSPD se distribuye bajo la **GNU General Public License v3 o posterior** (`GPL-3.0-or-later`).
 Texto completo en [`LICENSE`](./LICENSE).
