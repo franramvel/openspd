@@ -13,9 +13,10 @@
 //!   openspd-tui --exercise sentadilla --load 40
 //!   openspd-tui --profile sentadilla.lvp        (carga un perfil existente para seguir)
 
+use std::collections::HashSet;
 use std::io;
 use std::net::TcpStream;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,6 +27,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 
+use openspd::encoderv2;
 use openspd::profile::{self, default_v1rm, Lvp, Point};
 use openspd::protocol::{parse_line, Rep, ENCODER_HOST, ENCODER_PORT};
 
@@ -51,6 +53,11 @@ struct App {
     profile_path: String,
     msg: String,
     quit: bool,
+    // conexión (None = pantalla de selección de encoder)
+    rx: Option<Receiver<Msg>>,
+    scanning: bool,
+    scan_rx: Option<Receiver<Result<Vec<(String, String)>, String>>>,
+    scan_results: Vec<(String, String)>,
 }
 
 impl App {
@@ -95,6 +102,18 @@ impl App {
         } else {
             self.msg = format!("CSV guardado en {} (perfil necesita ≥2 cargas)", self.csv_path);
         }
+    }
+
+    /// Cierra la conexión y vuelve a la pantalla de selección (conserva perfil y CSV).
+    fn disconnect_to_select(&mut self) {
+        self.rx = None;
+        self.current_set.clear();
+        self.last_rep = None;
+        self.scanning = false;
+        self.scan_rx = None;
+        self.scan_results.clear();
+        self.status = "elige un encoder".into();
+        self.msg = "Desconectado. Elige encoder: 'w' WiFi · 'e' escanear BLE · 'q' salir".into();
     }
 }
 
@@ -150,6 +169,129 @@ fn spawn_reader(host: String, port: u16) -> Receiver<Msg> {
             }
         }
         let _ = tx.send(Msg::Closed);
+    });
+    rx
+}
+
+/// Escanea encoders v2 (BLE) en un hilo con runtime propio. Devuelve (dirección, etiqueta).
+fn spawn_ble_scan() -> Receiver<Result<Vec<(String, String)>, String>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(Err(e.to_string()));
+                return;
+            }
+        };
+        let res = rt.block_on(async {
+            use futures::StreamExt;
+            let service: uuid::Uuid = encoderv2::SERVICE_UUID.parse().map_err(|_| "uuid".to_string())?;
+            let session = bluer::Session::new().await.map_err(|e| e.to_string())?;
+            let adapter = session.default_adapter().await.map_err(|e| e.to_string())?;
+            adapter.set_powered(true).await.map_err(|e| e.to_string())?;
+            let mut disc = adapter.discover_devices().await.map_err(|e| e.to_string())?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+            let mut seen: HashSet<bluer::Address> = HashSet::new();
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    Some(ev) = disc.next() => {
+                        if let bluer::AdapterEvent::DeviceAdded(a) = ev { seen.insert(a); }
+                    }
+                    else => break,
+                }
+            }
+            let mut out = Vec::new();
+            for addr in seen {
+                if let Ok(dev) = adapter.device(addr) {
+                    let uuids = dev.uuids().await.ok().flatten().unwrap_or_default();
+                    if uuids.contains(&service) {
+                        out.push((addr.to_string(), format!("encoderv2 [{addr}]")));
+                    }
+                }
+            }
+            Ok::<_, String>(out)
+        });
+        let _ = tx.send(res);
+    });
+    rx
+}
+
+async fn ble_char(
+    dev: &bluer::Device,
+    uuid_str: &str,
+) -> Option<bluer::gatt::remote::Characteristic> {
+    let want: uuid::Uuid = uuid_str.parse().ok()?;
+    for s in dev.services().await.ok()? {
+        for c in s.characteristics().await.ok()? {
+            if c.uuid().await.ok()? == want {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// Conecta a un encoder v2 (BLE) por dirección, desbloquea, se suscribe y emite Reps (fase
+/// concéntrica) por el canal. Hilo con runtime propio.
+fn spawn_ble_reader(addr: String) -> Receiver<Msg> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(Msg::Status(e.to_string()));
+                return;
+            }
+        };
+        rt.block_on(async move {
+            use futures::StreamExt;
+            let run = async {
+                let _ = tx.send(Msg::Status(format!("conectando (v2) a {addr}…")));
+                let session = bluer::Session::new().await?;
+                let adapter = session.default_adapter().await?;
+                adapter.set_powered(true).await?;
+                let address: bluer::Address = addr.parse().map_err(|_| "dirección inválida")?;
+                let device = adapter.device(address)?;
+                if !device.is_connected().await? {
+                    device.connect().await?;
+                }
+                for _ in 0..50 {
+                    if device.is_services_resolved().await? {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let key = encoderv2::generate_key();
+                let unlock = ble_char(&device, encoderv2::CHAR_UNLOCK).await.ok_or("falta unlock")?;
+                unlock.write(&key.unlock_bytes).await?;
+                let rep_char = ble_char(&device, encoderv2::CHAR_REPETITION).await.ok_or("falta rep")?;
+                if let Some(be) = ble_char(&device, encoderv2::CHAR_BEGIN_END).await {
+                    let _ = be.write(encoderv2::begin_command(20, false, 'P').as_bytes()).await;
+                }
+                let _ = tx.send(Msg::Status("conectado (v2) · esperando reps".into()));
+                let notifs = rep_char.notify().await?;
+                tokio::pin!(notifs);
+                let mut reasm = encoderv2::Reassembler::new(key.aes_key);
+                while let Some(val) = notifs.next().await {
+                    for msg in reasm.push(&val) {
+                        if let Some(rep) = encoderv2::parse_repetition(&msg) {
+                            if rep.phase == encoderv2::Phase::Concentric
+                                && tx.send(Msg::Rep(rep.to_rep())).is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                Ok::<(), Box<dyn std::error::Error>>(())
+            };
+            if let Err(e) = run.await {
+                let _ = tx.send(Msg::Status(format!("error v2: {e}")));
+            }
+            let _ = tx.send(Msg::Closed);
+        });
     });
     rx
 }
@@ -227,14 +369,17 @@ fn main() -> io::Result<()> {
         rest: Duration::from_secs_f64(args.rest),
         csv_path,
         profile_path,
-        msg: "Ajusta carga con +/- · haz la serie · descansa o 'c' para cerrarla · 's' guarda · 'q' sale".into(),
+        msg: "Elige encoder: 'w' WiFi · 'e' escanear BLE · 'q' salir".into(),
         quit: false,
+        rx: None,
+        scanning: false,
+        scan_rx: None,
+        scan_results: Vec::new(),
     };
-
-    let rx = spawn_reader(args.host, args.port);
+    let _ = (args.host, args.port); // v1 usa el destino por defecto
 
     let mut terminal = ratatui::init();
-    let res = run(&mut terminal, &mut app, rx);
+    let res = run(&mut terminal, &mut app);
     ratatui::restore();
 
     app.save_all();
@@ -253,34 +398,66 @@ fn main() -> io::Result<()> {
 fn run<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    rx: Receiver<Msg>,
 ) -> io::Result<()> {
     while !app.quit {
-        // drenar mensajes del lector
-        loop {
-            match rx.try_recv() {
-                Ok(Msg::Rep(rep)) => app.add_rep(rep),
-                Ok(Msg::Status(s)) => app.status = s,
-                Ok(Msg::Closed) => app.status = "conexión cerrada por el encoder".into(),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
+        // recoger resultados del escaneo BLE
+        if let Some(srx) = &app.scan_rx {
+            if let Ok(res) = srx.try_recv() {
+                app.scanning = false;
+                match res {
+                    Ok(list) => {
+                        app.scan_results = list;
+                        app.msg = if app.scan_results.is_empty() {
+                            "No se encontraron encoders v2 (¿encendido? ¿BT del móvil apagado?)".into()
+                        } else {
+                            "Pulsa el número del encoder para conectar.".into()
+                        };
+                    }
+                    Err(e) => app.msg = format!("escaneo: {e}"),
+                }
+                app.scan_rx = None;
             }
         }
 
-        // fin de serie por descanso
-        if let Some(t) = app.last_rep {
-            if !app.current_set.is_empty() && t.elapsed() >= app.rest {
-                app.finalize_set();
+        if app.rx.is_some() {
+            // drenar mensajes (recoger primero para evitar conflicto de borrow)
+            let mut incoming = Vec::new();
+            if let Some(rx) = &app.rx {
+                while let Ok(m) = rx.try_recv() {
+                    incoming.push(m);
+                }
+            }
+            for m in incoming {
+                match m {
+                    Msg::Rep(rep) => app.add_rep(rep),
+                    Msg::Status(s) => app.status = s,
+                    Msg::Closed => app.status = "conexión cerrada por el encoder".into(),
+                }
+            }
+            // fin de serie por descanso
+            if let Some(t) = app.last_rep {
+                if !app.current_set.is_empty() && t.elapsed() >= app.rest {
+                    app.finalize_set();
+                }
             }
         }
 
-        terminal.draw(|f| ui(f, app))?;
+        if app.rx.is_some() {
+            terminal.draw(|f| ui(f, app))?;
+        } else {
+            terminal.draw(|f| ui_select(f, app))?;
+        }
 
         if event::poll(Duration::from_millis(120))? {
             if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if app.rx.is_some() {
+                    // modo conectado
                     match k.code {
                         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
+                        KeyCode::Char('b') => app.disconnect_to_select(),
                         KeyCode::Char('+') | KeyCode::Char('=') => app.load += 2.5,
                         KeyCode::Char('-') | KeyCode::Char('_') => app.load = (app.load - 2.5).max(0.0),
                         KeyCode::Char(']') => app.load += 10.0,
@@ -295,11 +472,89 @@ fn run<B: ratatui::backend::Backend>(
                         }
                         _ => {}
                     }
+                } else {
+                    // modo selección de encoder
+                    match k.code {
+                        KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
+                        KeyCode::Char('w') => {
+                            app.status = "conectando (v1 WiFi)…".into();
+                            app.rx = Some(spawn_reader(ENCODER_HOST.to_string(), ENCODER_PORT));
+                        }
+                        KeyCode::Char('e') if !app.scanning => {
+                            app.scanning = true;
+                            app.scan_results.clear();
+                            app.msg = "buscando encoders v2 (≈6 s)…".into();
+                            app.scan_rx = Some(spawn_ble_scan());
+                        }
+                        KeyCode::Char(d) if d.is_ascii_digit() => {
+                            let n = d.to_digit(10).unwrap() as usize;
+                            if n >= 1 && n <= app.scan_results.len() {
+                                let addr = app.scan_results[n - 1].0.clone();
+                                app.status = format!("conectando (v2) a {addr}…");
+                                app.rx = Some(spawn_ble_reader(addr));
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+fn ui_select(f: &mut Frame, app: &App) {
+    let root = Layout::vertical([Constraint::Length(3), Constraint::Min(6), Constraint::Length(3)])
+        .split(f.area());
+
+    let title = Line::from(vec![
+        Span::styled(" OpenSPD ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw("  Elige el encoder"),
+    ]);
+    f.render_widget(Paragraph::new(title).block(Block::default().borders(Borders::ALL)), root[0]);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(" w ", Style::default().fg(Color::Black).bg(Color::Green)),
+        Span::raw("  Encoder v1 — WiFi/TCP  ("),
+        Span::raw(format!("{ENCODER_HOST}:{ENCODER_PORT}")),
+        Span::raw(")"),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(" e ", Style::default().fg(Color::Black).bg(Color::Green)),
+        Span::raw("  Encoder v2 — BLE: escanear"),
+        Span::styled(
+            if app.scanning { "   (buscando…)" } else { "" },
+            Style::default().fg(Color::Yellow),
+        ),
+    ]));
+    for (i, (_, label)) in app.scan_results.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} ", i + 1), Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(format!("  {label}")),
+        ]));
+    }
+    if !app.msg.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(app.msg.clone(), Style::default().fg(Color::DarkGray)));
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Encoders ")),
+        root[1],
+    );
+
+    let help = Line::from(vec![
+        Span::styled(" w ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" WiFi  "),
+        Span::styled(" e ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" escanear BLE  "),
+        Span::styled(" 1-9 ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" conectar  "),
+        Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" salir"),
+    ]);
+    f.render_widget(Paragraph::new(help).block(Block::default().borders(Borders::ALL).title(" Atajos ")), root[2]);
 }
 
 fn ui(f: &mut Frame, app: &App) {
@@ -474,6 +729,8 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" deshacer punto  "),
         Span::styled(" s ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" guardar  "),
+        Span::styled(" b ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" cambiar encoder  "),
         Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" salir"),
     ]);
