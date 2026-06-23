@@ -139,7 +139,9 @@ fn print_set_summary(set: u32, reps: &[Rep], args: &Args) {
 fn main() {
     eprintln!(
         "OpenSPD {} · GPL-3.0-or-later, sin garantía. Software NO oficial; sin relación con \
-         Speed4lifts ni Vitruve (ver DISCLAIMER).",
+         Speed4lifts ni Vitruve (ver DISCLAIMER).\n\
+         Estimaciones (%1RM, velocity loss) orientativas: NO sustituyen a un profesional; \
+         entrenas bajo tu propia responsabilidad.",
         env!("CARGO_PKG_VERSION")
     );
     let args = parse_args();

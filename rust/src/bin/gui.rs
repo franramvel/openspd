@@ -10,13 +10,15 @@
 //! Uso:  cargo run --release --bin openspd-gui
 //!       (opcional)  --exercise sentadilla  --load 40  --profile sentadilla.lvp
 
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::collections::HashSet;
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use egui_plot::{Bar, BarChart, Line, Plot, PlotPoints, Points};
 
+use openspd::encoderv2;
 use openspd::profile::{self, default_v1rm, Lvp, Point};
 use openspd::protocol::{parse_line, Rep, ENCODER_HOST, ENCODER_PORT};
 
@@ -85,6 +87,129 @@ fn spawn_reader(host: String, port: u16) -> Receiver<Msg> {
     rx
 }
 
+/// Escanea encoders v2 (BLE) en un hilo con runtime propio. Devuelve (dirección, etiqueta).
+fn spawn_ble_scan() -> Receiver<Result<Vec<(String, String)>, String>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(Err(e.to_string()));
+                return;
+            }
+        };
+        let res = rt.block_on(async {
+            use futures::StreamExt;
+            let service: uuid::Uuid = encoderv2::SERVICE_UUID.parse().map_err(|_| "uuid".to_string())?;
+            let session = bluer::Session::new().await.map_err(|e| e.to_string())?;
+            let adapter = session.default_adapter().await.map_err(|e| e.to_string())?;
+            adapter.set_powered(true).await.map_err(|e| e.to_string())?;
+            let mut disc = adapter.discover_devices().await.map_err(|e| e.to_string())?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+            let mut seen: HashSet<bluer::Address> = HashSet::new();
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    Some(ev) = disc.next() => {
+                        if let bluer::AdapterEvent::DeviceAdded(a) = ev { seen.insert(a); }
+                    }
+                    else => break,
+                }
+            }
+            let mut out = Vec::new();
+            for addr in seen {
+                if let Ok(dev) = adapter.device(addr) {
+                    let uuids = dev.uuids().await.ok().flatten().unwrap_or_default();
+                    if uuids.contains(&service) {
+                        out.push((addr.to_string(), format!("encoderv2  [{addr}]")));
+                    }
+                }
+            }
+            Ok::<_, String>(out)
+        });
+        let _ = tx.send(res);
+    });
+    rx
+}
+
+async fn ble_char(
+    dev: &bluer::Device,
+    uuid_str: &str,
+) -> Option<bluer::gatt::remote::Characteristic> {
+    let want: uuid::Uuid = uuid_str.parse().ok()?;
+    for s in dev.services().await.ok()? {
+        for c in s.characteristics().await.ok()? {
+            if c.uuid().await.ok()? == want {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// Conecta a un encoder v2 (BLE) por dirección, desbloquea, se suscribe y emite Reps (fase
+/// concéntrica) por el canal. Hilo con runtime propio.
+fn spawn_ble_reader(addr: String) -> Receiver<Msg> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(Msg::Status(e.to_string()));
+                return;
+            }
+        };
+        rt.block_on(async move {
+            use futures::StreamExt;
+            let run = async {
+                let _ = tx.send(Msg::Status(format!("conectando (v2) a {addr}…")));
+                let session = bluer::Session::new().await?;
+                let adapter = session.default_adapter().await?;
+                adapter.set_powered(true).await?;
+                let address: bluer::Address = addr.parse().map_err(|_| "dirección inválida")?;
+                let device = adapter.device(address)?;
+                if !device.is_connected().await? {
+                    device.connect().await?;
+                }
+                for _ in 0..50 {
+                    if device.is_services_resolved().await? {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let key = encoderv2::generate_key();
+                let unlock = ble_char(&device, encoderv2::CHAR_UNLOCK).await.ok_or("falta unlock")?;
+                unlock.write(&key.unlock_bytes).await?;
+                let rep_char = ble_char(&device, encoderv2::CHAR_REPETITION).await.ok_or("falta rep")?;
+                if let Some(be) = ble_char(&device, encoderv2::CHAR_BEGIN_END).await {
+                    let _ = be.write(encoderv2::begin_command(20, false, 'P').as_bytes()).await;
+                }
+                let _ = tx.send(Msg::Status("conectado (v2) · esperando reps".into()));
+                let notifs = rep_char.notify().await?;
+                tokio::pin!(notifs);
+                let mut reasm = encoderv2::Reassembler::new(key.aes_key);
+                while let Some(val) = notifs.next().await {
+                    for msg in reasm.push(&val) {
+                        if let Some(rep) = encoderv2::parse_repetition(&msg) {
+                            if rep.phase == encoderv2::Phase::Concentric
+                                && tx.send(Msg::Rep(rep.to_rep())).is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                Ok::<(), Box<dyn std::error::Error>>(())
+            };
+            if let Err(e) = run.await {
+                let _ = tx.send(Msg::Status(format!("error v2: {e}")));
+            }
+            let _ = tx.send(Msg::Closed);
+        });
+    });
+    rx
+}
+
 struct GuiApp {
     exercise: String,
     v1rm: f64,
@@ -100,7 +225,12 @@ struct GuiApp {
     last_rep: Option<Instant>,
     csv_path: String,
     profile_path: String,
-    rx: Receiver<Msg>,
+    // conexión (None = aún en pantalla de selección de encoder)
+    rx: Option<Receiver<Msg>>,
+    // escaneo BLE
+    scanning: bool,
+    scan_rx: Option<Receiver<Result<Vec<(String, String)>, String>>>,
+    scan_results: Vec<(String, String)>,
 }
 
 impl GuiApp {
@@ -150,13 +280,42 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // drenar canal
-        loop {
-            match self.rx.try_recv() {
-                Ok(Msg::Rep(rep)) => self.add_rep(rep),
-                Ok(Msg::Status(s)) => self.status = s,
-                Ok(Msg::Closed) => self.status = "conexión cerrada por el encoder".into(),
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        // recoger resultados del escaneo BLE
+        if let Some(srx) = &self.scan_rx {
+            if let Ok(res) = srx.try_recv() {
+                self.scanning = false;
+                match res {
+                    Ok(list) => {
+                        self.scan_results = list;
+                        if self.scan_results.is_empty() {
+                            self.msg = "No se encontraron encoders v2 (¿encendido? ¿BT del móvil apagado?)".into();
+                        }
+                    }
+                    Err(e) => self.msg = format!("escaneo: {e}"),
+                }
+                self.scan_rx = None;
+            }
+        }
+
+        // pantalla de selección si aún no hay conexión
+        if self.rx.is_none() {
+            self.select_screen(ctx);
+            ctx.request_repaint_after(Duration::from_millis(150));
+            return;
+        }
+
+        // drenar canal de la conexión activa (recoger primero para evitar conflicto de borrow)
+        let mut incoming = Vec::new();
+        if let Some(rx) = &self.rx {
+            while let Ok(m) = rx.try_recv() {
+                incoming.push(m);
+            }
+        }
+        for m in incoming {
+            match m {
+                Msg::Rep(rep) => self.add_rep(rep),
+                Msg::Status(s) => self.status = s,
+                Msg::Closed => self.status = "conexión cerrada por el encoder".into(),
             }
         }
         // cierre de serie por descanso
@@ -176,16 +335,75 @@ impl eframe::App for GuiApp {
 }
 
 impl GuiApp {
-    fn top_bar(&self, ctx: &egui::Context) {
+    fn select_screen(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(8.0);
+            ui.heading("OpenSPD — elige el encoder");
+            ui.add_space(12.0);
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(egui::RichText::new("Encoder v1 — WiFi").strong());
+                ui.label("Requiere estar conectado al AP del encoder (ver README).");
+                if ui.button(format!("▶ Conectar (TCP {ENCODER_HOST}:{ENCODER_PORT})")).clicked() {
+                    self.status = "conectando (v1)…".into();
+                    self.rx = Some(spawn_reader(ENCODER_HOST.to_string(), ENCODER_PORT));
+                }
+            });
+
+            ui.add_space(10.0);
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(egui::RichText::new("Encoder v2 — BLE").strong());
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!self.scanning, egui::Button::new("🔍 Buscar encoders")).clicked() {
+                        self.scanning = true;
+                        self.scan_results.clear();
+                        self.msg = "buscando encoders v2…".into();
+                        self.scan_rx = Some(spawn_ble_scan());
+                    }
+                    if self.scanning {
+                        ui.spinner();
+                        ui.label("buscando (≈6 s)…");
+                    }
+                });
+                for (addr, label) in self.scan_results.clone() {
+                    if ui.button(format!("▶ Conectar a {label}")).clicked() {
+                        self.status = format!("conectando (v2) a {addr}…");
+                        self.rx = Some(spawn_ble_reader(addr));
+                    }
+                }
+            });
+
+            ui.add_space(12.0);
+            ui.weak(&self.msg);
+        });
+    }
+
+    fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("OpenSPD");
+                if ui.button("⟵ Cambiar encoder").clicked() {
+                    self.disconnect_to_select();
+                }
                 ui.separator();
                 ui.label(format!("Serie {}", self.set_idx));
                 ui.separator();
-                ui.label(egui::RichText::new(&self.status).color(egui::Color32::LIGHT_BLUE));
+                ui.label(egui::RichText::new(self.status.clone()).color(egui::Color32::LIGHT_BLUE));
             });
         });
+    }
+
+    /// Cierra la conexión actual y vuelve a la pantalla de selección de encoder.
+    fn disconnect_to_select(&mut self) {
+        self.rx = None; // al soltar el Receiver, el hilo lector termina en su próximo envío
+        self.current_set.clear();
+        self.last_rep = None;
+        self.scanning = false;
+        self.scan_rx = None;
+        self.scan_results.clear();
+        self.status = "elige un encoder".into();
+        self.msg = "Desconectado. Elige un encoder. (El perfil y las series guardadas se conservan.)".into();
     }
 
     fn controls(&mut self, ctx: &egui::Context) {
@@ -335,8 +553,6 @@ impl GuiApp {
 }
 
 struct Args {
-    host: String,
-    port: u16,
     exercise: String,
     load: f64,
     csv: Option<String>,
@@ -346,8 +562,6 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut a = Args {
-        host: ENCODER_HOST.to_string(),
-        port: ENCODER_PORT,
         exercise: "sentadilla".into(),
         load: 20.0,
         csv: None,
@@ -357,8 +571,6 @@ fn parse_args() -> Args {
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--host" => a.host = it.next().unwrap_or(a.host),
-            "--port" => a.port = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.port),
             "--exercise" => a.exercise = it.next().unwrap_or(a.exercise),
             "--load" => a.load = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.load),
             "--csv" => a.csv = it.next(),
@@ -385,15 +597,13 @@ fn main() -> eframe::Result<()> {
     let points = args.loaded.as_ref().map(|l| l.points.clone()).unwrap_or_default();
     let lvp = args.loaded;
 
-    let rx = spawn_reader(args.host.clone(), args.port);
-
     let app = GuiApp {
         exercise: args.exercise,
         v1rm,
         load: args.load,
         rest_secs: 20.0,
-        status: "iniciando…".into(),
-        msg: "Pon una carga, haz la serie, descansa o pulsa 'Cerrar serie'. Repite con varias cargas.".into(),
+        status: "elige un encoder para empezar".into(),
+        msg: "Elige el encoder. Tras conectar: pon carga, haz la serie y descansa (o 'Cerrar serie').".into(),
         set_idx: 1,
         current_set: Vec::new(),
         log: Vec::new(),
@@ -402,7 +612,10 @@ fn main() -> eframe::Result<()> {
         last_rep: None,
         csv_path,
         profile_path,
-        rx,
+        rx: None,
+        scanning: false,
+        scan_rx: None,
+        scan_results: Vec::new(),
     };
 
     let opts = eframe::NativeOptions {

@@ -22,11 +22,22 @@ path = "src/bin/tui.rs"
 name = "openspd-gui"
 path = "src/bin/gui.rs"
 
+[[bin]]
+name = "openspd-ble"
+path = "src/bin/ble.rs"
+
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
 eframe = "0.29"
 egui_plot = "0.29"
+# BLE (encoder v2)
+aes = "0.8"
+rand = "0.8"
+bluer = { version = "0.17", features = ["bluetoothd"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+futures = "0.3"
+uuid = "1"
 
 [profile.release]
 opt-level = 3
