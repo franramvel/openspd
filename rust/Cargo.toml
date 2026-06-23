@@ -1,14 +1,37 @@
-[package]
-name = "openspd"
+[workspace]
+members = ["crates/core", "crates/io", "crates/ffi"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "OpenSPD — grabadora VBT para encoder de 1a gen (WiFi)"
 license = "GPL-3.0-or-later"
 authors = ["OpenSPD contributors"]
 
-[lib]
-name = "openspd"
-path = "src/lib.rs"
+# Dependencias compartidas por los crates del workspace (una sola versión en un sitio).
+[workspace.dependencies]
+openspd-core = { path = "crates/core" }
+openspd-io = { path = "crates/io" }
+# core (lógica pura)
+aes = "0.8"
+rand = "0.8"
+# io (transporte escritorio)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+bluer = { version = "0.17", features = ["bluetoothd"] }
+futures = "0.3"
+uuid = "1"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Paquete de ESCRITORIO: solo UI (CLI/TUI/GUI/BLE). Todo el I/O vive en openspd-io,
+# todo el dominio en openspd-core. Este paquete no toca sockets, BLE ni filesystem
+# de protocolo directamente.
+[package]
+name = "openspd-desktop"
+description = "OpenSPD — apps de escritorio (CLI/TUI/GUI) para el encoder VBT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
 
 [[bin]]
 name = "openspd"
@@ -27,17 +50,12 @@ name = "openspd-ble"
 path = "src/bin/ble.rs"
 
 [dependencies]
+openspd-core.workspace = true
+openspd-io.workspace = true
 ratatui = "0.29"
 crossterm = "0.28"
 eframe = "0.29"
 egui_plot = "0.29"
-# BLE (encoder v2)
-aes = "0.8"
-rand = "0.8"
-bluer = { version = "0.17", features = ["bluetoothd"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
-futures = "0.3"
-uuid = "1"
 
 [profile.release]
 opt-level = 3

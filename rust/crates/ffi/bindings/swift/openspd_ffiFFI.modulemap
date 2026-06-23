@@ -1,0 +1,4 @@
+module openspd_ffiFFI {
+    header "openspd_ffiFFI.h"
+    export *
+}

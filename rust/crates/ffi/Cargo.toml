@@ -1,0 +1,23 @@
+# openspd-ffi — capa de bindings (uniffi) que expone openspd-core a Kotlin (Android) y Swift (iOS).
+# Compila como librería dinámica/estática para móvil. El networking NO se expone: las apps hacen
+# el TCP/BLE nativo y delegan en el core el parsing, las métricas, el perfil y la cripto v2.
+[package]
+name = "openspd-ffi"
+description = "OpenSPD — bindings uniffi (Kotlin/Swift) sobre openspd-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "openspd_ffi"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+# Binario para generar los bindings: `cargo run -p openspd-ffi --bin uniffi-bindgen -- ...`
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+openspd-core = { workspace = true }
+uniffi = { version = "0.28", features = ["cli"] }
