@@ -183,7 +183,4 @@ sobre las siguientes bases:
 - **No se redistribuye** firmware, claves ni código del fabricante: este repositorio contiene solo
   código original propio y la documentación del formato observado.
 
-> ⚠️ El punto más sensible es **publicar el código de descifrado del encoder v2** (§4): es donde la
-> cobertura de la excepción es menos explícita. Lo anterior es **orientación general, no asesoría
-> legal**; antes de hacer público ese módulo conviene consultarlo con un especialista en propiedad
-> intelectual en tu jurisdicción.
+Lo anterior es una declaración de buena fe sobre el propósito del proyecto, **no asesoría legal**.
