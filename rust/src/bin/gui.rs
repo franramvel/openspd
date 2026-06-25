@@ -37,6 +37,13 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Acción de borrado elegida durante el render; se aplica tras cerrar los closures de egui
+/// (no se puede mutar `self.log`/`self.points` mientras se itera para pintar).
+enum DeleteAction {
+    Series(u32),
+    Rep(u32, usize),
+}
+
 struct GuiApp {
     exercise: String,
     v1rm: f64,
@@ -51,6 +58,8 @@ struct GuiApp {
     current_set: Vec<Rep>,
     log: Vec<(u32, Rep, u64)>,
     points: Vec<Point>,
+    // point_set[i] = set_idx que generó points[i]; None = punto precargado de un perfil (sin reps)
+    point_set: Vec<Option<u32>>,
     lvp: Option<Lvp>,
     last_rep: Option<Instant>,
     // temporizador de preparación antes de iniciar la serie
@@ -107,12 +116,91 @@ impl GuiApp {
         let best = self.current_set.iter().map(|r| r.mean_velocity).fold(f64::MIN, f64::max);
         let load = self.current_load();
         self.points.push(Point { load_kg: load, best_velocity: best });
+        self.point_set.push(Some(self.set_idx));
         self.refit();
         self.msg = format!("Serie {} → punto ({:.1} kg, {:.2} m/s)", self.set_idx, load, best);
         self.set_idx += 1;
         self.current_set.clear();
         self.last_rep = None;
         self.vl_alarm_fired = false; // la próxima serie podrá volver a disparar la alarma
+    }
+
+    /// set_idx de las series ya cerradas (con reps en el log y set_idx < el de la serie en curso),
+    /// en orden ascendente.
+    fn finalized_set_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = Vec::new();
+        for (s, _, _) in &self.log {
+            if *s < self.set_idx && !ids.contains(s) {
+                ids.push(*s);
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Reps de una serie, en orden de registro.
+    fn reps_of_set(&self, set_idx: u32) -> Vec<Rep> {
+        self.log.iter().filter(|(s, _, _)| *s == set_idx).map(|(_, r, _)| *r).collect()
+    }
+
+    /// Carga registrada para una serie cerrada (la del punto del perfil), si existe.
+    fn load_of_set(&self, set_idx: u32) -> Option<f64> {
+        self.point_set.iter().position(|p| *p == Some(set_idx)).map(|i| self.points[i].load_kg)
+    }
+
+    /// Borra una serie cerrada entera y renumera correlativamente las posteriores.
+    fn delete_series(&mut self, set_idx: u32) {
+        self.log.retain(|(s, _, _)| *s != set_idx);
+        for (s, _, _) in self.log.iter_mut() {
+            if *s > set_idx {
+                *s -= 1;
+            }
+        }
+        if let Some(i) = self.point_set.iter().position(|p| *p == Some(set_idx)) {
+            self.points.remove(i);
+            self.point_set.remove(i);
+        }
+        for s in self.point_set.iter_mut().flatten() {
+            if *s > set_idx {
+                *s -= 1;
+            }
+        }
+        if self.set_idx > 1 {
+            self.set_idx -= 1;
+        }
+        self.refit();
+        let _ = openspd_io::save_session_csv(&self.csv_path, &self.log);
+        self.msg = format!("Serie {set_idx} eliminada (series renumeradas)");
+    }
+
+    /// Borra la rep `pos` (posición dentro de la serie) de una serie cerrada.
+    fn delete_rep(&mut self, set_idx: u32, pos: usize) {
+        let log_idx = self
+            .log
+            .iter()
+            .enumerate()
+            .filter(|(_, (s, _, _))| *s == set_idx)
+            .nth(pos)
+            .map(|(i, _)| i);
+        let Some(log_idx) = log_idx else { return };
+        self.log.remove(log_idx);
+        // si es la serie en curso, mantener current_set en sincronía con el log
+        if set_idx == self.set_idx && pos < self.current_set.len() {
+            self.current_set.remove(pos);
+        }
+
+        let remaining = self.reps_of_set(set_idx);
+        if remaining.is_empty() && set_idx != self.set_idx {
+            self.delete_series(set_idx);
+            return;
+        }
+        if let Some(i) = self.point_set.iter().position(|p| *p == Some(set_idx)) {
+            let best = remaining.iter().map(|r| r.mean_velocity).fold(f64::MIN, f64::max);
+            self.points[i].best_velocity = best;
+            self.refit();
+        }
+        let _ = openspd_io::save_session_csv(&self.csv_path, &self.log);
+        self.msg = format!("Rep {} de la serie {set_idx} eliminada", pos + 1);
     }
 
     fn add_rep(&mut self, rep: Rep) {
@@ -366,6 +454,7 @@ impl GuiApp {
                 if ui.button("Cerrar serie").clicked() { self.finalize_set(); }
                 if ui.button("Deshacer punto").clicked() {
                     if self.points.pop().is_some() {
+                        self.point_set.pop();
                         self.refit();
                         self.msg = "Último punto eliminado".into();
                     }
@@ -443,10 +532,13 @@ impl GuiApp {
 
             ui.separator();
 
-            // tabla de reps
+            // acción de borrado elegida en este frame (se aplica al final)
+            let mut pending: Option<DeleteAction> = None;
+
+            // tabla de reps de la serie actual (con ✕ para borrar la rep)
             egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::Grid::new("reps").striped(true).num_columns(5).show(ui, |ui| {
-                    for h in ["rep", "media (m/s)", "ROM (cm)", "pico (m/s)", "VL %"] {
+                egui::Grid::new("reps").striped(true).num_columns(6).show(ui, |ui| {
+                    for h in ["rep", "media (m/s)", "ROM (cm)", "pico (m/s)", "VL %", ""] {
                         ui.strong(h);
                     }
                     ui.end_row();
@@ -457,10 +549,58 @@ impl GuiApp {
                         ui.label(format!("{:.1}", r.rom));
                         ui.label(format!("{:.2}", r.peak_velocity));
                         ui.label(format!("{:.1}", vl));
+                        if ui.small_button("🗑").on_hover_text("Eliminar esta rep").clicked() {
+                            pending = Some(DeleteAction::Rep(self.set_idx, i));
+                        }
                         ui.end_row();
                     }
                 });
+
+                // revisión en línea de las series anteriores (cerradas)
+                let ids = self.finalized_set_ids();
+                if !ids.is_empty() {
+                    ui.separator();
+                    ui.heading("Series anteriores");
+                    for set_idx in ids {
+                        let reps = self.reps_of_set(set_idx);
+                        let best = reps.iter().map(|r| r.mean_velocity).fold(f64::MIN, f64::max);
+                        let load = self.load_of_set(set_idx);
+                        let title = format!(
+                            "Serie {set_idx} · {} · {} reps · mejor {best:.2} m/s",
+                            load.map(|l| format!("{l:.1} kg")).unwrap_or_else(|| "— kg".into()),
+                            reps.len(),
+                        );
+                        egui::CollapsingHeader::new(title).id_salt(set_idx).show(ui, |ui| {
+                            if ui.button("🗑 Eliminar serie").clicked() {
+                                pending = Some(DeleteAction::Series(set_idx));
+                            }
+                            egui::Grid::new(("hist", set_idx)).striped(true).num_columns(5).show(ui, |ui| {
+                                for h in ["rep", "media (m/s)", "ROM (cm)", "pico (m/s)", ""] {
+                                    ui.strong(h);
+                                }
+                                ui.end_row();
+                                for (i, r) in reps.iter().enumerate() {
+                                    ui.label(format!("{}", i + 1));
+                                    ui.label(format!("{:.2}", r.mean_velocity));
+                                    ui.label(format!("{:.1}", r.rom));
+                                    ui.label(format!("{:.2}", r.peak_velocity));
+                                    if ui.small_button("🗑").on_hover_text("Eliminar esta rep").clicked() {
+                                        pending = Some(DeleteAction::Rep(set_idx, i));
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                    }
+                }
             });
+
+            // aplicar el borrado fuera de los closures de pintado
+            match pending {
+                Some(DeleteAction::Series(s)) => self.delete_series(s),
+                Some(DeleteAction::Rep(s, p)) => self.delete_rep(s, p),
+                None => {}
+            }
         });
     }
 
@@ -566,6 +706,7 @@ fn main() -> eframe::Result<()> {
     let profile_path = args.profile_path.unwrap_or_else(|| format!("{}.lvp", args.exercise));
     let v1rm = args.loaded.as_ref().map(|l| l.v1rm).unwrap_or_else(|| default_v1rm(&args.exercise));
     let points = args.loaded.as_ref().map(|l| l.points.clone()).unwrap_or_default();
+    let point_set = vec![None; points.len()]; // los puntos precargados no tienen reps en el log
     let lvp = args.loaded;
 
     // salida de audio para los beeps/alarma; si no hay dispositivo, el GUI va en silencio
@@ -589,6 +730,7 @@ fn main() -> eframe::Result<()> {
         current_set: Vec::new(),
         log: Vec::new(),
         points,
+        point_set,
         lvp,
         last_rep: None,
         csv_path,
