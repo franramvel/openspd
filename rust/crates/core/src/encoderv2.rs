@@ -7,7 +7,7 @@
 //! - Nada más conectar, el central ESCRIBE una "llave" (texto) en la característica de desbloqueo;
 //!   si no se escribe, el encoder corta la conexión a los ~3 s.
 //! - El stream de cada repetición llega cifrado en bloques de 16 bytes. Descifra con **AES-128-ECB**
-//!   usando como clave los **primeros 16 bytes de la llave que tú mismo escribiste** (el cliente
+//!   usando como clave los **primeros 16 bytes de la llave que escribió el propio cliente** (el cliente
 //!   elige la clave; el encoder cifra sus datos con ella). Se confirma porque al descifrar la
 //!   captura con esa clave aparece texto ASCII legible.
 //! - Estructura de la llave vista en la captura: 19 caracteres, con un dígito en los índices 2, 5 y
