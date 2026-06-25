@@ -41,6 +41,9 @@ struct App {
     lvp: Option<Lvp>,
     last_rep: Option<Instant>,
     rest: Duration,
+    // temporizador de preparación antes de iniciar la serie
+    prep_secs: f64,
+    countdown_until: Option<Instant>,
     csv_path: String,
     profile_path: String,
     msg: String,
@@ -84,6 +87,21 @@ impl App {
         let _ = openspd_io::save_session_csv(&self.csv_path, &self.log);
     }
 
+    /// Arranca la cuenta atrás de preparación: limpia la serie en curso y, mientras
+    /// está activa, las reps que llegan del encoder se descartan (no se cuentan).
+    fn start_countdown(&mut self) {
+        self.current_set.clear();
+        self.last_rep = None;
+        self.countdown_until = Some(Instant::now() + Duration::from_secs_f64(self.prep_secs));
+        self.msg = format!("Prepárate… la serie empieza en {:.0} s", self.prep_secs);
+    }
+
+    /// Segundos restantes de la cuenta atrás, o `None` si no hay ninguna activa.
+    fn countdown_remaining(&self) -> Option<f64> {
+        self.countdown_until
+            .map(|end| end.saturating_duration_since(Instant::now()).as_secs_f64())
+    }
+
     fn save_all(&mut self) {
         let _ = openspd_io::save_session_csv(&self.csv_path, &self.log);
         if let Some(lvp) = &self.lvp {
@@ -101,6 +119,7 @@ impl App {
         self.rx = None;
         self.current_set.clear();
         self.last_rep = None;
+        self.countdown_until = None;
         self.scanning = false;
         self.scan_rx = None;
         self.scan_results.clear();
@@ -120,6 +139,7 @@ struct Args {
     v1rm: f64,
     load: f64,
     rest: f64,
+    prep: f64,
     csv: Option<String>,
     profile_path: Option<String>,
     loaded: Option<Lvp>,
@@ -131,6 +151,7 @@ fn parse_args() -> Args {
     let mut exercise = "sentadilla".to_string();
     let mut load = 20.0;
     let mut rest = 20.0;
+    let mut prep = 5.0;
     let mut csv = None;
     let mut profile_path = None;
     let mut loaded = None;
@@ -144,6 +165,7 @@ fn parse_args() -> Args {
             "--exercise" => exercise = it.next().unwrap_or(exercise),
             "--load" => load = it.next().and_then(|v| v.parse().ok()).unwrap_or(load),
             "--rest" => rest = it.next().and_then(|v| v.parse().ok()).unwrap_or(rest),
+            "--prep" => prep = it.next().and_then(|v| v.parse().ok()).unwrap_or(prep),
             "--v1rm" => v1rm_override = it.next().and_then(|v| v.parse().ok()),
             "--csv" => csv = it.next(),
             "--profile" => {
@@ -159,7 +181,7 @@ fn parse_args() -> Args {
         }
     }
     let v1rm = v1rm_override.unwrap_or_else(|| default_v1rm(&exercise));
-    Args { host, port, exercise, v1rm, load, rest, csv, profile_path, loaded }
+    Args { host, port, exercise, v1rm, load, rest, prep, csv, profile_path, loaded }
 }
 
 fn main() -> io::Result<()> {
@@ -184,6 +206,8 @@ fn main() -> io::Result<()> {
         lvp,
         last_rep: None,
         rest: Duration::from_secs_f64(args.rest),
+        prep_secs: args.prep,
+        countdown_until: None,
         csv_path,
         profile_path,
         msg: "Elige encoder: 'w' WiFi · 'e' escanear BLE · 'q' salir".into(),
@@ -237,6 +261,17 @@ fn run<B: ratatui::backend::Backend>(
         }
 
         if app.rx.is_some() {
+            // ¿hay una cuenta atrás de preparación activa? si acaba de expirar, la cerramos
+            let counting_down = match app.countdown_until {
+                Some(end) if Instant::now() < end => true,
+                Some(_) => {
+                    app.countdown_until = None;
+                    app.msg = "¡Ya! Empieza la serie.".into();
+                    false
+                }
+                None => false,
+            };
+
             // drenar mensajes (recoger primero para evitar conflicto de borrow)
             let mut incoming = Vec::new();
             if let Some(rx) = &app.rx {
@@ -246,15 +281,22 @@ fn run<B: ratatui::backend::Backend>(
             }
             for m in incoming {
                 match m {
-                    RepEvent::Rep(rep) => app.add_rep(rep),
+                    // durante la cuenta atrás descartamos las reps: te estás colocando en posición
+                    RepEvent::Rep(rep) => {
+                        if !counting_down {
+                            app.add_rep(rep);
+                        }
+                    }
                     RepEvent::Status(s) => app.status = s,
                     RepEvent::Closed => app.status = "conexión cerrada por el encoder".into(),
                 }
             }
-            // fin de serie por descanso
-            if let Some(t) = app.last_rep {
-                if !app.current_set.is_empty() && t.elapsed() >= app.rest {
-                    app.finalize_set();
+            // fin de serie por descanso (no mientras nos preparamos)
+            if !counting_down {
+                if let Some(t) = app.last_rep {
+                    if !app.current_set.is_empty() && t.elapsed() >= app.rest {
+                        app.finalize_set();
+                    }
                 }
             }
         }
@@ -280,6 +322,15 @@ fn run<B: ratatui::backend::Backend>(
                         KeyCode::Char(']') => app.load += 10.0,
                         KeyCode::Char('[') => app.load = (app.load - 10.0).max(0.0),
                         KeyCode::Char('c') => app.finalize_set(),
+                        KeyCode::Char('t') => app.start_countdown(),
+                        KeyCode::Char('<') | KeyCode::Char(',') => {
+                            app.prep_secs = (app.prep_secs - 1.0).max(0.0);
+                            app.msg = format!("Preparación: {:.0} s", app.prep_secs);
+                        }
+                        KeyCode::Char('>') | KeyCode::Char('.') => {
+                            app.prep_secs = (app.prep_secs + 1.0).min(60.0);
+                            app.msg = format!("Preparación: {:.0} s", app.prep_secs);
+                        }
                         KeyCode::Char('s') => app.save_all(),
                         KeyCode::Char('u') => {
                             if app.points.pop().is_some() {
@@ -393,6 +444,20 @@ fn ui(f: &mut Frame, app: &App) {
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    // si hay cuenta atrás de preparación activa, la mostramos bien visible
+    if let Some(rem) = app.countdown_remaining() {
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" ⏱ PREPÁRATE · EMPIEZA EN {:.0} ", rem.ceil()),
+                Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   Carga: "),
+            Span::styled(format!("{:.1} kg", app.load), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("   (las repeticiones no cuentan todavía)"),
+        ]);
+        f.render_widget(Paragraph::new(line).block(Block::default().borders(Borders::ALL)), area);
+        return;
+    }
     let line = Line::from(vec![
         Span::styled(" OpenSPD ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw("  Ejercicio: "),
@@ -542,6 +607,10 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" ±10  "),
         Span::styled(" c ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" cerrar serie  "),
+        Span::styled(" t ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" preparar (cuenta atrás)  "),
+        Span::styled(" <  > ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" ±1 s prep  "),
         Span::styled(" u ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" deshacer punto  "),
         Span::styled(" s ", Style::default().fg(Color::Black).bg(Color::Gray)),

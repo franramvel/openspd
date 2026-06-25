@@ -40,6 +40,9 @@ struct GuiApp {
     points: Vec<Point>,
     lvp: Option<Lvp>,
     last_rep: Option<Instant>,
+    // temporizador de preparación antes de iniciar la serie
+    prep_secs: f64,
+    countdown_until: Option<Instant>,
     csv_path: String,
     profile_path: String,
     // conexión (None = aún en pantalla de selección de encoder)
@@ -73,6 +76,21 @@ impl GuiApp {
         self.log.push((self.set_idx, rep, now_unix()));
         self.last_rep = Some(Instant::now());
         let _ = openspd_io::save_session_csv(&self.csv_path, &self.log);
+    }
+
+    /// Arranca la cuenta atrás de preparación: limpia la serie en curso y, mientras
+    /// está activa, las reps que llegan del encoder se descartan (no se cuentan).
+    fn start_countdown(&mut self) {
+        self.current_set.clear();
+        self.last_rep = None;
+        self.countdown_until = Some(Instant::now() + Duration::from_secs_f64(self.prep_secs));
+        self.msg = format!("Prepárate… la serie empieza en {:.0} s", self.prep_secs);
+    }
+
+    /// Segundos restantes de la cuenta atrás, o `None` si no hay ninguna activa.
+    fn countdown_remaining(&self) -> Option<f64> {
+        self.countdown_until
+            .map(|end| end.saturating_duration_since(Instant::now()).as_secs_f64())
     }
 
     fn save_all(&mut self) {
@@ -121,6 +139,17 @@ impl eframe::App for GuiApp {
             return;
         }
 
+        // ¿hay una cuenta atrás de preparación activa? si acaba de expirar, la cerramos
+        let counting_down = match self.countdown_until {
+            Some(end) if Instant::now() < end => true,
+            Some(_) => {
+                self.countdown_until = None;
+                self.msg = "¡Ya! Empieza la serie.".into();
+                false
+            }
+            None => false,
+        };
+
         // drenar canal de la conexión activa (recoger primero para evitar conflicto de borrow)
         let mut incoming = Vec::new();
         if let Some(rx) = &self.rx {
@@ -130,15 +159,22 @@ impl eframe::App for GuiApp {
         }
         for m in incoming {
             match m {
-                RepEvent::Rep(rep) => self.add_rep(rep),
+                // durante la cuenta atrás descartamos las reps: te estás colocando en posición
+                RepEvent::Rep(rep) => {
+                    if !counting_down {
+                        self.add_rep(rep);
+                    }
+                }
                 RepEvent::Status(s) => self.status = s,
                 RepEvent::Closed => self.status = "conexión cerrada por el encoder".into(),
             }
         }
-        // cierre de serie por descanso
-        if let Some(t) = self.last_rep {
-            if !self.current_set.is_empty() && t.elapsed().as_secs_f64() >= self.rest_secs {
-                self.finalize_set();
+        // cierre de serie por descanso (no mientras nos preparamos)
+        if !counting_down {
+            if let Some(t) = self.last_rep {
+                if !self.current_set.is_empty() && t.elapsed().as_secs_f64() >= self.rest_secs {
+                    self.finalize_set();
+                }
             }
         }
         // repintar aunque no haya eventos (para refrescar reps que llegan del hilo)
@@ -216,6 +252,7 @@ impl GuiApp {
         self.rx = None; // al soltar el Receiver, el hilo lector termina en su próximo envío
         self.current_set.clear();
         self.last_rep = None;
+        self.countdown_until = None;
         self.scanning = false;
         self.scan_rx = None;
         self.scan_results.clear();
@@ -245,6 +282,7 @@ impl GuiApp {
                 if ui.button("+2.5").clicked() { self.load += 2.5; }
                 if ui.button("+10").clicked() { self.load += 10.0; }
                 ui.separator();
+                if ui.button("▶ Iniciar serie (cuenta atrás)").clicked() { self.start_countdown(); }
                 if ui.button("Cerrar serie").clicked() { self.finalize_set(); }
                 if ui.button("Deshacer punto").clicked() {
                     if self.points.pop().is_some() {
@@ -255,6 +293,9 @@ impl GuiApp {
                 if ui.button("💾 Guardar").clicked() { self.save_all(); }
             });
             ui.horizontal(|ui| {
+                ui.label("Preparación (cuenta atrás):");
+                ui.add(egui::DragValue::new(&mut self.prep_secs).speed(1.0).range(0.0..=30.0).suffix(" s"));
+                ui.separator();
                 ui.label("Descanso para cerrar serie:");
                 ui.add(egui::DragValue::new(&mut self.rest_secs).speed(1.0).range(3.0..=180.0).suffix(" s"));
                 ui.separator();
@@ -265,6 +306,27 @@ impl GuiApp {
 
     fn current_set_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
+            // si hay cuenta atrás de preparación activa, la mostramos bien visible
+            if let Some(rem) = self.countdown_remaining() {
+                ui.add_space(20.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("PREPÁRATE")
+                            .size(28.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(220, 60, 60)),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("{:.0}", rem.ceil()))
+                            .size(96.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(220, 60, 60)),
+                    );
+                    ui.label(egui::RichText::new("las repeticiones aún no cuentan").weak());
+                });
+                return;
+            }
+
             ui.heading(format!("Serie actual · {} reps · {:.1} kg", self.current_set.len(), self.load));
 
             // velocity loss
@@ -372,6 +434,7 @@ impl GuiApp {
 struct Args {
     exercise: String,
     load: f64,
+    prep: f64,
     csv: Option<String>,
     profile_path: Option<String>,
     loaded: Option<Lvp>,
@@ -381,6 +444,7 @@ fn parse_args() -> Args {
     let mut a = Args {
         exercise: "sentadilla".into(),
         load: 20.0,
+        prep: 5.0,
         csv: None,
         profile_path: None,
         loaded: None,
@@ -390,6 +454,7 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--exercise" => a.exercise = it.next().unwrap_or(a.exercise),
             "--load" => a.load = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.load),
+            "--prep" => a.prep = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.prep),
             "--csv" => a.csv = it.next(),
             "--profile" => {
                 if let Some(p) = it.next() {
@@ -419,6 +484,8 @@ fn main() -> eframe::Result<()> {
         v1rm,
         load: args.load,
         rest_secs: 20.0,
+        prep_secs: args.prep,
+        countdown_until: None,
         status: "elige un encoder para empezar".into(),
         msg: "Elige el encoder. Tras conectar: pon carga, haz la serie y descansa (o 'Cerrar serie').".into(),
         set_idx: 1,
