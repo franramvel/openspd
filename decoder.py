@@ -5,8 +5,8 @@
 Decodificador en vivo del encoder VBT (1a gen, WiFi).
 
 Protocolo descubierto por ingenieria inversa:
-    Te conectas por TCP al AP del encoder (192.168.4.1:80) y este EMITE
-    automaticamente (no hay que pedir nada) lineas ASCII con este formato:
+    El cliente se conecta por TCP al AP del encoder (192.168.4.1:80) y este EMITE
+    lineas ASCII con este formato:
 
         @<seq>*<campo1>#<campo2>$<campo3>&\r\n
 

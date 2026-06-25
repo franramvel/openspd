@@ -27,7 +27,7 @@ Este software se proporciona **"TAL CUAL", SIN GARANTÍA DE NINGÚN TIPO**, seg�
 - Las métricas (velocidad, ROM, **velocity loss**, **estimaciones de %1RM y 1RM**) son
   **orientativas** y pueden contener errores. **No** constituyen consejo médico ni de entrenamiento.
 - El uso de OpenSPD y de cualquier equipo de entrenamiento es **responsabilidad exclusiva del
-  usuario**. Entrena de forma segura y consulta a un profesional cuando proceda.
+  usuario**, quien debe entrenar de forma segura y consultar a un profesional cuando proceda.
 
 ## Licencia
 

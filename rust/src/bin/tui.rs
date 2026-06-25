@@ -2,13 +2,13 @@
 // Copyright (C) 2026 OpenSPD contributors
 //! TUI para el encoder VBT: dashboard en vivo + constructor de perfil carga-velocidad.
 //!
-//! Flujo para construir tu perfil:
-//!   1) Ajusta la carga (kg) con +/-  (paso 2.5) o  [ ]  (paso 10). En dominada/fondo (peso
+//! Flujo para construir el perfil:
+//!   1) La carga (kg) se ajusta con +/-  (paso 2.5) o  [ ]  (paso 10). En dominada/fondo (peso
 //!      corporal) esas teclas editan el LASTRE; el peso corporal se fija con --bodyweight y la
 //!      carga total = peso corporal + lastre.
-//!   2) Haz la serie a esa carga. Cada rep aparece en vivo.
-//!   3) Descansa (o pulsa 'c'): la serie se cierra y se añade un punto (carga, mejor velocidad)
-//!      al perfil. Repite con 2-3 cargas distintas y el perfil se ajusta solo (1RM, R²).
+//!   2) Se hace la serie a esa carga. Cada rep aparece en vivo.
+//!   3) Al descansar (o pulsar 'c') la serie se cierra y se añade un punto (carga, mejor velocidad)
+//!      al perfil. Con 2-3 cargas distintas el perfil se ajusta solo (1RM, R²).
 //!   4) 's' guarda perfil + CSV. 'u' deshace el último punto. 'q' sale (guarda).
 //!
 //! Uso:
@@ -30,7 +30,9 @@ use ratatui::{Frame, Terminal};
 
 use openspd_core::metrics::velocity_loss;
 use openspd_core::profile::{self, default_v1rm, Lvp, Point};
-use openspd_core::protocol::{Rep, ENCODER_HOST, ENCODER_PORT};
+use openspd_core::protocol::{
+    start_command, ExerciseV1, Rep, DEFAULT_ROM_CM, ENCODER_HOST, ENCODER_PORT,
+};
 use openspd_io::RepEvent;
 
 struct App {
@@ -746,7 +748,14 @@ fn run<B: ratatui::backend::Backend>(
                         }
                         KeyCode::Char('w') => {
                             app.status = "conectando (v1 WiFi)…".into();
-                            app.rx = Some(openspd_io::spawn_tcp_reader(ENCODER_HOST.to_string(), ENCODER_PORT));
+                            // El v1 necesita el comando de arranque con el ejercicio para emitir reps.
+                            let mode = ExerciseV1::from_name(&app.exercise).unwrap_or(ExerciseV1::Test);
+                            let command = start_command(mode, DEFAULT_ROM_CM, false);
+                            app.rx = Some(openspd_io::spawn_tcp_reader(
+                                ENCODER_HOST.to_string(),
+                                ENCODER_PORT,
+                                Some(command),
+                            ));
                         }
                         KeyCode::Char('e') if !app.scanning => {
                             app.scanning = true;

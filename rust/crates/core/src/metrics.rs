@@ -71,7 +71,7 @@ pub enum EqSource {
     Validada,
     /// Estimación GENÉRICA sugerida (el ejercicio no tiene ecuación propia validada): recta
     /// anclada en el umbral de velocidad al 1RM del ejercicio con una pendiente media. Es
-    /// orientativa; construye tu perfil individual para precisión.
+    /// orientativa; conviene construir un perfil individual para precisión.
     Generica,
 }
 
@@ -81,7 +81,7 @@ pub enum EqSource {
 const GENERIC_SLOPE: f64 = -90.0;
 
 /// Estima el %1RM a partir de la velocidad media usando ecuaciones carga-velocidad
-/// publicadas (poblacionales). APROXIMADO: para precision construye tu propio perfil
+/// publicadas (poblacionales). APROXIMADO: para precision conviene construir un perfil propio
 /// carga-velocidad (registra velocidades a cargas conocidas y ajusta una recta).
 ///
 /// Solo coeficientes (datos/hechos, no protegidos por copyright), con su fuente:
@@ -128,7 +128,7 @@ pub fn est_1rm_kg(load_kg: f64, pct_1rm: f64) -> Option<f64> {
     Some(load_kg / (pct_1rm / 100.0))
 }
 
-/// Zona de carga orientativa (squat) segun velocidad media. Ajustar con tu perfil.
+/// Zona de carga orientativa (squat) segun velocidad media. Ajustar con un perfil propio.
 pub fn load_zone(mean_velocity: f64) -> &'static str {
     if mean_velocity >= 1.0 {
         "Fuerza-velocidad / explosivo (carga ligera)"

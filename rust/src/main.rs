@@ -5,7 +5,7 @@
 //! - Conecta por TCP a 192.168.4.1:80 (transporte en `openspd-io`).
 //! - Decodifica cada repeticion en vivo: velocidad media/pico, ROM, VELOCITY LOSS.
 //! - Detecta SERIES automaticamente por el descanso entre reps y muestra un resumen por serie.
-//! - Estima %1RM (y 1RM) si le das ejercicio y carga.
+//! - Estima %1RM (y 1RM) si se le da ejercicio y carga.
 //! - Guarda todo en CSV de forma INCREMENTAL (tras cada rep): un Ctrl-C nunca pierde datos.
 //!
 //! Uso:
@@ -24,7 +24,9 @@ use openspd_core::metrics::{
     est_1rm_kg, est_1rm_pct_src, load_zone, summarize, velocity_loss, EqSource,
 };
 use openspd_core::profile::Lvp;
-use openspd_core::protocol::{Rep, ENCODER_HOST, ENCODER_PORT};
+use openspd_core::protocol::{
+    start_command, ExerciseV1, Rep, DEFAULT_ROM_CM, ENCODER_HOST, ENCODER_PORT,
+};
 use openspd_io::RepEvent;
 
 struct Args {
@@ -39,6 +41,8 @@ struct Args {
     rest: f64, // segundos sin reps para considerar nueva serie
     profile: Option<Lvp>,
     user: Option<String>,
+    rom: Option<u32>, // umbral de ROM (cm) para el comando de arranque del v1
+    eccentric: bool,  // medir fase excéntrica (E='1' en el comando del v1)
 }
 
 /// Rep + numero de serie + timestamp unix, para el registro/CSV.
@@ -61,6 +65,8 @@ fn parse_args() -> Args {
         rest: 30.0,
         profile: None,
         user: None,
+        rom: None,
+        eccentric: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -75,6 +81,8 @@ fn parse_args() -> Args {
             "--bodyweight" => a.bodyweight = it.next().and_then(|v| v.parse().ok()),
             "--added-load" | "--lastre" => a.added_load = it.next().and_then(|v| v.parse().ok()),
             "--rest" => a.rest = it.next().and_then(|v| v.parse().ok()).unwrap_or(30.0),
+            "--rom" => a.rom = it.next().and_then(|v| v.parse().ok()),
+            "--excentrica" | "--eccentric" => a.eccentric = true,
             "--profile" => {
                 if let Some(path) = it.next() {
                     match openspd_io::load_profile(&path) {
@@ -87,7 +95,7 @@ fn parse_args() -> Args {
                 }
             }
             "-h" | "--help" => {
-                println!("Uso: openspd [--user NOMBRE] [--exercise NOMBRE] [--load KG] [--bodyweight KG] [--added-load KG] [--vl-stop PCT] [--rest SEG] [--csv ARCHIVO] [--host H] [--port P]");
+                println!("Uso: openspd [--user NOMBRE] [--exercise NOMBRE] [--load KG] [--bodyweight KG] [--added-load KG] [--rom CM] [--excentrica] [--vl-stop PCT] [--rest SEG] [--csv ARCHIVO] [--host H] [--port P]");
                 std::process::exit(0);
             }
             other => eprintln!("(aviso) argumento ignorado: {other}"),
@@ -120,7 +128,7 @@ fn print_set_summary(set: u32, reps: &[Rep], args: &Args) {
             // perfil individual: mas preciso
             let pct = lvp.pct_1rm(s.best_mean_velocity);
             println!(
-                "  → %1RM {:.0}% · 1RM {:.0} kg  [tu perfil {}, R² {:.3}]",
+                "  → %1RM {:.0}% · 1RM {:.0} kg  [perfil {}, R² {:.3}]",
                 pct, lvp.one_rm_kg, lvp.exercise, lvp.r2
             );
         } else if let Some(ex) = &args.exercise {
@@ -141,7 +149,7 @@ fn print_set_summary(set: u32, reps: &[Rep], args: &Args) {
             }
             match src {
                 EqSource::Validada => println!("  [poblacional validada]"),
-                EqSource::Generica => println!("  [genérica sugerida · usa tu perfil]"),
+                EqSource::Generica => println!("  [genérica sugerida · conviene un perfil propio]"),
             }
         }
         println!();
@@ -153,7 +161,7 @@ fn main() {
         "OpenSPD {} · GPL-3.0-or-later, sin garantía. Software NO oficial; sin relación con \
          Speed4lifts ni Vitruve (ver DISCLAIMER).\n\
          Estimaciones (%1RM, velocity loss) orientativas: NO sustituyen a un profesional; \
-         entrenas bajo tu propia responsabilidad.",
+         el uso es bajo responsabilidad del usuario.",
         env!("CARGO_PKG_VERSION")
     );
     let mut args = parse_args();
@@ -192,9 +200,21 @@ fn main() {
     );
     println!("{}", "-".repeat(74));
 
+    // Comando de arranque del v1: selecciona el ejercicio en el encoder (sin él NO emite reps).
+    // Mapea --exercise a un modo nativo del v1; si no encaja (o no se dio), usa el modo Test (9).
+    let v1_mode = args
+        .exercise
+        .as_deref()
+        .and_then(ExerciseV1::from_name)
+        .unwrap_or(ExerciseV1::Test);
+    let rom = args.rom.unwrap_or(DEFAULT_ROM_CM);
+    let command = start_command(v1_mode, rom, args.eccentric);
+    println!("Modo encoder v1: {v1_mode:?} · ROM≥{rom} cm{} (cmd ?{command})",
+        if args.eccentric { " · excéntrica" } else { "" });
+
     // El transporte vive en openspd-io; aquí solo consumimos el canal. Usamos recv_timeout para
     // poder detectar el fin de serie por descanso aunque no lleguen reps.
-    let rx = openspd_io::spawn_tcp_reader(args.host.clone(), args.port);
+    let rx = openspd_io::spawn_tcp_reader(args.host.clone(), args.port, Some(command));
 
     let mut log: Vec<LoggedRep> = Vec::new();
     let mut current_set: Vec<Rep> = Vec::new();

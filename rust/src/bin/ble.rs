@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OpenSPD contributors
 //! OpenSPD — cliente BLE para el encoder VBT "v2" (datos cifrados).
 //!
-//! Escanea los encoders disponibles, te deja ELEGIR uno, conecta, descifra las repeticiones
+//! Escanea los encoders disponibles, permite ELEGIR uno, conecta, descifra las repeticiones
 //! (AES-128-ECB) y las muestra/guarda con TODO el detalle (ambas fases, aceleraciones). Todo el
 //! transporte BLE vive en `openspd-io`; este binario es solo CLI + presentación.
 //!
@@ -76,7 +76,7 @@ fn main() {
     eprintln!(
         "OpenSPD {} · GPL-3.0-or-later, sin garantía. Software NO oficial; cliente de interoperabilidad.\n\
          Estimaciones (%1RM, velocity loss) orientativas: NO sustituyen a un profesional; \
-         entrenas bajo tu propia responsabilidad.",
+         el uso es bajo responsabilidad del usuario.",
         env!("CARGO_PKG_VERSION")
     );
     let args = parse_args();

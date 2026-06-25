@@ -19,7 +19,9 @@ use egui_plot::{Bar, BarChart, Line, Plot, PlotPoints, Points};
 
 use openspd_core::metrics::velocity_loss;
 use openspd_core::profile::{self, default_v1rm, Lvp, Point};
-use openspd_core::protocol::{Rep, ENCODER_HOST, ENCODER_PORT};
+use openspd_core::protocol::{
+    start_command, ExerciseV1, Rep, DEFAULT_ROM_CM, ENCODER_HOST, ENCODER_PORT,
+};
 use openspd_io::RepEvent;
 
 // Para dominada/fondo la carga es la TOTAL = peso corporal + lastre (ver profile::is_bodyweight).
@@ -555,7 +557,14 @@ impl GuiApp {
                 ui.label("Requiere estar conectado al AP del encoder (ver README).");
                 if ui.button(format!("▶ Conectar (TCP {ENCODER_HOST}:{ENCODER_PORT})")).clicked() {
                     self.status = "conectando (v1)…".into();
-                    self.rx = Some(openspd_io::spawn_tcp_reader(ENCODER_HOST.to_string(), ENCODER_PORT));
+                    // El v1 necesita el comando de arranque con el ejercicio para emitir reps.
+                    let mode = ExerciseV1::from_name(&self.exercise).unwrap_or(ExerciseV1::Test);
+                    let command = start_command(mode, DEFAULT_ROM_CM, false);
+                    self.rx = Some(openspd_io::spawn_tcp_reader(
+                        ENCODER_HOST.to_string(),
+                        ENCODER_PORT,
+                        Some(command),
+                    ));
                 }
             });
 
@@ -952,7 +961,7 @@ fn main() -> eframe::Result<()> {
         prep_secs: args.prep,
         countdown_until: None,
         status: "elige un encoder para empezar".into(),
-        msg: "Elige el encoder. Tras conectar: pon carga, haz la serie y descansa (o 'Cerrar serie').".into(),
+        msg: "Seleccionar un encoder. Tras conectar: fijar carga, hacer la serie y descansar (o 'Cerrar serie').".into(),
         set_idx: 1,
         current_set: Vec::new(),
         log: Vec::new(),

@@ -65,7 +65,7 @@ def summarize(reps: list[Rep]) -> SetSummary | None:
 
 
 # Zonas de velocidad orientativas (squat) para feedback de carga.
-# Son aproximadas y dependen del ejercicio; ajustar con tu perfil carga-velocidad.
+# Son aproximadas y dependen del ejercicio; ajustar con un perfil carga-velocidad propio.
 def load_zone(mean_velocity: float) -> str:
     if mean_velocity >= 1.0:
         return "Fuerza-velocidad / explosivo (carga ligera)"

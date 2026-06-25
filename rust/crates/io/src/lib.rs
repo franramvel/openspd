@@ -56,11 +56,19 @@ pub enum BleEvent {
 // ─────────────────────────────── TCP (encoder v1) ───────────────────────────────
 
 /// Conecta por TCP al encoder v1 en un hilo y emite cada repetición parseada por el canal.
-pub fn spawn_tcp_reader(host: String, port: u16) -> Receiver<RepEvent> {
+///
+/// `command` es el *payload* de arranque del encoder v1 ([`openspd_core::protocol::start_command`],
+/// sin el prefijo `?`): selecciona el ejercicio en su pantalla. El encoder **no emite reps hasta
+/// recibirlo**, así que se envía como `?<payload>\n` y se reintenta cada segundo (hasta 5 veces)
+/// hasta que el encoder devuelve el eco `!<payload>`. Con `None` se lee en pasivo (compatibilidad).
+pub fn spawn_tcp_reader(host: String, port: u16, command: Option<String>) -> Receiver<RepEvent> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        use std::io::{BufRead, BufReader};
+        use std::io::{BufRead, BufReader, Write};
         use std::net::TcpStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
         let _ = tx.send(RepEvent::Status(format!("conectando a {host}:{port}…")));
         let stream = match TcpStream::connect((host.as_str(), port)) {
             Ok(s) => s,
@@ -69,11 +77,52 @@ pub fn spawn_tcp_reader(host: String, port: u16) -> Receiver<RepEvent> {
                 return;
             }
         };
+
+        // Handshake del v1: reenvía "?<payload>\n" cada segundo hasta ver el eco "!<payload>".
+        // `confirmed` arranca en true si no hay comando (lectura pasiva): nada que confirmar.
+        let confirmed = Arc::new(AtomicBool::new(command.is_none()));
+        if let Some(payload) = command.clone() {
+            match stream.try_clone() {
+                Ok(mut writer) => {
+                    let confirmed = confirmed.clone();
+                    let line = format!("?{payload}\n");
+                    let _ = tx.send(RepEvent::Status(format!("enviando modo ({line:?})…")));
+                    thread::spawn(move || {
+                        for _ in 0..5 {
+                            if confirmed.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            if writer.write_all(line.as_bytes()).is_err() {
+                                break;
+                            }
+                            let _ = writer.flush();
+                            thread::sleep(Duration::from_secs(1));
+                        }
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(RepEvent::Status(format!("aviso: no se pudo enviar el modo: {e}")));
+                }
+            }
+        }
+
         let _ = tx.send(RepEvent::Status("conectado · esperando reps".into()));
         let reader = BufReader::new(stream);
         for line in reader.lines() {
             match line {
                 Ok(l) => {
+                    // Eco del comando: una línea "…!<payload>" confirma el modo (corta los reintentos).
+                    if let Some(payload) = command.as_deref() {
+                        if let Some(idx) = l.find('!') {
+                            if l[idx + 1..].trim() == payload {
+                                // Solo anunciamos la confirmación la primera vez (el encoder repite el eco).
+                                if !confirmed.swap(true, Ordering::Relaxed) {
+                                    let _ = tx.send(RepEvent::Status("modo confirmado · midiendo".into()));
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     if let Some(rep) = parse_line(&l) {
                         if tx.send(RepEvent::Rep(rep)).is_err() {
                             return;

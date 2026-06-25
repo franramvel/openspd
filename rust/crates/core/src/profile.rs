@@ -3,7 +3,7 @@
 //! Perfil carga-velocidad individual (Load-Velocity Profile, LVP).
 //!
 //! Modelo: la velocidad media cae linealmente con la carga ->  v = a + b·carga  (b < 0).
-//! Ajustando esa recta con tus datos (carga, mejor velocidad) y conociendo el umbral de
+//! Ajustando esa recta con datos propios (carga, mejor velocidad) y conociendo el umbral de
 //! velocidad al que se levanta el 1RM (V1RM, propio del ejercicio), se obtiene:
 //!   1RM (kg)   = (V1RM - a) / b
 //!   %1RM(v)    = 100·(a - v)/(a - V1RM)     (=100 cuando v=V1RM, =0 cuando v=a)
