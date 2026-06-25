@@ -32,14 +32,60 @@ pub struct Lvp {
     pub points: Vec<Point>,
 }
 
-/// Umbral de velocidad al 1RM (velocidad media) por ejercicio. Valores de referencia.
+/// Umbral de velocidad al 1RM (velocidad media, m/s) por ejercicio. Valores de referencia de la
+/// literatura carga-velocidad (MVT = Minimal Velocity Threshold). Aproximados: la velocidad al
+/// 1RM varía bastante entre personas (CV ~10-25%), por eso el perfil INDIVIDUAL es más preciso.
+///
+/// - banca ≈ 0.17 (González-Badillo & Sánchez-Medina 2010)
+/// - sentadilla profunda ≈ 0.30 (Sánchez-Medina et al. 2017)
+/// - peso muerto ≈ 0.31 (Lake et al. / análisis carga-velocidad del peso muerto, 2020; ~0.30-0.33)
+/// - press militar/hombro ≈ 0.19 (perfiles de press de hombro; MPV al 1RM ~0.19)
+/// - remo / prone bench pull ≈ 0.40 (sugerido; el remo conserva bastante velocidad al 1RM)
+/// - hip thrust ≈ 0.25 (perfiles de hip thrust; ~0.25-0.32)
+/// - dominada y fondo: SUGERIDOS (sin consenso publicado para tracción/empuje vertical).
+///   La carga a registrar es la TOTAL = peso corporal + lastre (ver [`is_bodyweight`]).
 pub fn default_v1rm(exercise: &str) -> f64 {
     match exercise.to_lowercase().as_str() {
-        "banca" | "bench" | "press" => 0.17,
+        "banca" | "bench" | "press banca" | "bench press" => 0.17,
         "sentadilla" | "squat" => 0.30,
-        "peso muerto" | "deadlift" => 0.50,
+        "peso muerto" | "deadlift" => 0.31,
+        "press militar" | "military press" | "overhead press" | "ohp" | "press hombro" => 0.19,
+        "remo" | "row" | "remo tumbado" | "prone bench pull" | "bench pull" => 0.40,
+        "hip thrust" | "empuje de cadera" => 0.25,
+        "dominada" | "pull-up" | "pull up" | "dominada lastrada" | "weighted pull-up" => 0.23,
+        "fondo" | "fondos" | "dip" | "dips" | "paralelas" => 0.20,
+        "press" => 0.17, // alias histórico de banca
         _ => 0.30,
     }
+}
+
+/// True para ejercicios de PESO CORPORAL (dominada, fondo...). En ellos la carga que debe
+/// registrarse en el perfil es la carga TOTAL movida = peso corporal + lastre, NO solo el lastre.
+/// El músculo no distingue discos de peso corporal: solo siente la carga total, así que un único
+/// perfil "dominada" cubre de forma continua desde peso corporal hasta dominada lastrada. Ver
+/// [`total_bodyweight_load`].
+pub fn is_bodyweight(exercise: &str) -> bool {
+    matches!(
+        exercise.to_lowercase().as_str(),
+        "dominada"
+            | "pull-up"
+            | "pull up"
+            | "dominada lastrada"
+            | "weighted pull-up"
+            | "fondo"
+            | "fondos"
+            | "dip"
+            | "dips"
+            | "paralelas"
+    )
+}
+
+/// Carga total movida en un ejercicio de peso corporal = peso corporal + lastre añadido.
+/// `added_kg` puede ser negativo (banda/máquina de asistencia). Es la carga que debe ir al perfil
+/// y a la estimación de %1RM: así un solo ejercicio cubre peso corporal y lastrado sin romper la
+/// recta carga-velocidad (el 1RM resultante también es la carga total = peso corporal + lastre).
+pub fn total_bodyweight_load(bodyweight_kg: f64, added_kg: f64) -> f64 {
+    bodyweight_kg + added_kg
 }
 
 /// Ajusta la recta por minimos cuadrados. Necesita >=2 cargas distintas.

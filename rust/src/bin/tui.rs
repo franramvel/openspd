@@ -3,7 +3,9 @@
 //! TUI para el encoder VBT: dashboard en vivo + constructor de perfil carga-velocidad.
 //!
 //! Flujo para construir tu perfil:
-//!   1) Ajusta la carga (kg) con +/-  (paso 2.5) o  [ ]  (paso 10).
+//!   1) Ajusta la carga (kg) con +/-  (paso 2.5) o  [ ]  (paso 10). En dominada/fondo (peso
+//!      corporal) esas teclas editan el LASTRE; el peso corporal se fija con --bodyweight y la
+//!      carga total = peso corporal + lastre.
 //!   2) Haz la serie a esa carga. Cada rep aparece en vivo.
 //!   3) Descansa (o pulsa 'c'): la serie se cierra y se añade un punto (carga, mejor velocidad)
 //!      al perfil. Repite con 2-3 cargas distintas y el perfil se ajusta solo (1RM, R²).
@@ -11,6 +13,7 @@
 //!
 //! Uso:
 //!   openspd-tui --exercise sentadilla --load 40
+//!   openspd-tui --exercise dominada --bodyweight 78 --lastre 20   (carga total = 98 kg)
 //!   openspd-tui --profile sentadilla.lvp        (carga un perfil existente para seguir)
 
 use std::io;
@@ -33,6 +36,9 @@ struct App {
     exercise: String,
     v1rm: f64,
     load: f64,
+    // ejercicios de peso corporal (dominada, fondo): la carga total = peso corporal + lastre
+    bodyweight_kg: f64,
+    added_load_kg: f64,
     status: String,
     set_idx: u32,
     current_set: Vec<Rep>,
@@ -60,6 +66,26 @@ impl App {
         self.lvp = profile::fit(&self.exercise, self.points.clone(), self.v1rm);
     }
 
+    /// Carga total usada para el perfil. En ejercicios de peso corporal es peso corporal + lastre;
+    /// en el resto, la carga única editable.
+    fn current_load(&self) -> f64 {
+        if profile::is_bodyweight(&self.exercise) {
+            profile::total_bodyweight_load(self.bodyweight_kg, self.added_load_kg)
+        } else {
+            self.load
+        }
+    }
+
+    /// Ajusta la carga editable con las teclas: el lastre en peso corporal (admite negativo por
+    /// asistencia), o la carga total en el resto (acotada a >=0).
+    fn adjust_load(&mut self, delta: f64) {
+        if profile::is_bodyweight(&self.exercise) {
+            self.added_load_kg += delta;
+        } else {
+            self.load = (self.load + delta).max(0.0);
+        }
+    }
+
     fn finalize_set(&mut self) {
         if self.current_set.is_empty() {
             return;
@@ -69,11 +95,12 @@ impl App {
             .iter()
             .map(|r| r.mean_velocity)
             .fold(f64::MIN, f64::max);
-        self.points.push(Point { load_kg: self.load, best_velocity: best });
+        let load = self.current_load();
+        self.points.push(Point { load_kg: load, best_velocity: best });
         self.refit();
         self.msg = format!(
             "Serie {} cerrada → punto ({:.1} kg, {:.2} m/s)",
-            self.set_idx, self.load, best
+            self.set_idx, load, best
         );
         self.set_idx += 1;
         self.current_set.clear();
@@ -138,6 +165,8 @@ struct Args {
     exercise: String,
     v1rm: f64,
     load: f64,
+    bodyweight: f64,
+    added_load: f64,
     rest: f64,
     prep: f64,
     csv: Option<String>,
@@ -150,6 +179,8 @@ fn parse_args() -> Args {
     let mut port = ENCODER_PORT;
     let mut exercise = "sentadilla".to_string();
     let mut load = 20.0;
+    let mut bodyweight = 75.0;
+    let mut added_load = 0.0;
     let mut rest = 20.0;
     let mut prep = 5.0;
     let mut csv = None;
@@ -164,6 +195,8 @@ fn parse_args() -> Args {
             "--port" => port = it.next().and_then(|v| v.parse().ok()).unwrap_or(port),
             "--exercise" => exercise = it.next().unwrap_or(exercise),
             "--load" => load = it.next().and_then(|v| v.parse().ok()).unwrap_or(load),
+            "--bodyweight" => bodyweight = it.next().and_then(|v| v.parse().ok()).unwrap_or(bodyweight),
+            "--added-load" | "--lastre" => added_load = it.next().and_then(|v| v.parse().ok()).unwrap_or(added_load),
             "--rest" => rest = it.next().and_then(|v| v.parse().ok()).unwrap_or(rest),
             "--prep" => prep = it.next().and_then(|v| v.parse().ok()).unwrap_or(prep),
             "--v1rm" => v1rm_override = it.next().and_then(|v| v.parse().ok()),
@@ -181,7 +214,7 @@ fn parse_args() -> Args {
         }
     }
     let v1rm = v1rm_override.unwrap_or_else(|| default_v1rm(&exercise));
-    Args { host, port, exercise, v1rm, load, rest, prep, csv, profile_path, loaded }
+    Args { host, port, exercise, v1rm, load, bodyweight, added_load, rest, prep, csv, profile_path, loaded }
 }
 
 fn main() -> io::Result<()> {
@@ -198,6 +231,8 @@ fn main() -> io::Result<()> {
         exercise: args.exercise,
         v1rm: args.v1rm,
         load: args.load,
+        bodyweight_kg: args.bodyweight,
+        added_load_kg: args.added_load,
         status: "iniciando…".into(),
         set_idx: 1,
         current_set: Vec::new(),
@@ -317,10 +352,11 @@ fn run<B: ratatui::backend::Backend>(
                     match k.code {
                         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
                         KeyCode::Char('b') => app.disconnect_to_select(),
-                        KeyCode::Char('+') | KeyCode::Char('=') => app.load += 2.5,
-                        KeyCode::Char('-') | KeyCode::Char('_') => app.load = (app.load - 2.5).max(0.0),
-                        KeyCode::Char(']') => app.load += 10.0,
-                        KeyCode::Char('[') => app.load = (app.load - 10.0).max(0.0),
+                        // en peso corporal +/- [ ] editan el lastre (puede ser negativo); si no, la carga
+                        KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_load(2.5),
+                        KeyCode::Char('-') | KeyCode::Char('_') => app.adjust_load(-2.5),
+                        KeyCode::Char(']') => app.adjust_load(10.0),
+                        KeyCode::Char('[') => app.adjust_load(-10.0),
                         KeyCode::Char('c') => app.finalize_set(),
                         KeyCode::Char('t') => app.start_countdown(),
                         KeyCode::Char('<') | KeyCode::Char(',') => {
@@ -443,6 +479,20 @@ fn ui(f: &mut Frame, app: &App) {
     draw_help(f, root[2], app);
 }
 
+/// Etiqueta de carga para la barra de estado: en peso corporal desglosa peso corporal + lastre.
+fn load_label(app: &App) -> String {
+    if profile::is_bodyweight(&app.exercise) {
+        format!(
+            "PC {:.1} + lastre {:.1} = {:.1} kg",
+            app.bodyweight_kg,
+            app.added_load_kg,
+            app.current_load()
+        )
+    } else {
+        format!("{:.1} kg", app.current_load())
+    }
+}
+
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     // si hay cuenta atrás de preparación activa, la mostramos bien visible
     if let Some(rem) = app.countdown_remaining() {
@@ -452,7 +502,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             Span::raw("   Carga: "),
-            Span::styled(format!("{:.1} kg", app.load), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(load_label(app), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             Span::raw("   (las repeticiones no cuentan todavía)"),
         ]);
         f.render_widget(Paragraph::new(line).block(Block::default().borders(Borders::ALL)), area);
@@ -463,7 +513,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("  Ejercicio: "),
         Span::styled(&app.exercise, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::raw("   Carga: "),
-        Span::styled(format!("{:.1} kg", app.load), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(load_label(app), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
         Span::raw("   Serie: "),
         Span::styled(format!("{}", app.set_idx), Style::default().fg(Color::Magenta)),
         Span::raw("   ["),
@@ -602,7 +652,7 @@ fn draw_profile(f: &mut Frame, area: Rect, app: &App) {
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let help = Line::from(vec![
         Span::styled(" +/- ", Style::default().fg(Color::Black).bg(Color::Gray)),
-        Span::raw(" carga ±2.5  "),
+        Span::raw(if profile::is_bodyweight(&app.exercise) { " lastre ±2.5  " } else { " carga ±2.5  " }),
         Span::styled(" [ ] ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" ±10  "),
         Span::styled(" c ", Style::default().fg(Color::Black).bg(Color::Gray)),

@@ -158,10 +158,16 @@ pub fn summarize(reps: Vec<Rep>) -> Option<SetSummary> {
     metrics::summarize(&v).map(Into::into)
 }
 
-/// %1RM estimado por ecuación poblacional. `None` si el ejercicio no tiene ecuación.
+/// %1RM estimado por ecuación poblacional validada. `None` si el ejercicio no tiene ecuación propia.
 #[uniffi::export]
 pub fn est_1rm_pct(exercise: String, mean_velocity: f64) -> Option<f64> {
     metrics::est_1rm_pct(&exercise, mean_velocity)
+}
+
+/// %1RM estimado: ecuación validada si existe, si no estimación genérica sugerida. Nunca `None`.
+#[uniffi::export]
+pub fn est_1rm_pct_any(exercise: String, mean_velocity: f64) -> f64 {
+    metrics::est_1rm_pct_src(&exercise, mean_velocity).0
 }
 
 /// 1RM (kg) a partir de la carga usada y el %1RM correspondiente. `None` si %1RM <= 0.
@@ -245,6 +251,20 @@ impl Reassembler {
 #[uniffi::export]
 pub fn default_v1rm(exercise: String) -> f64 {
     profile::default_v1rm(&exercise)
+}
+
+/// True si el ejercicio es de peso corporal (dominada, fondo...): la carga a registrar es la
+/// carga TOTAL = peso corporal + lastre.
+#[uniffi::export]
+pub fn is_bodyweight(exercise: String) -> bool {
+    profile::is_bodyweight(&exercise)
+}
+
+/// Carga total movida en un ejercicio de peso corporal = peso corporal + lastre (`added_kg`
+/// puede ser negativo si hay asistencia). Es la carga que debe ir al perfil y al %1RM.
+#[uniffi::export]
+pub fn total_bodyweight_load(bodyweight_kg: f64, added_kg: f64) -> f64 {
+    profile::total_bodyweight_load(bodyweight_kg, added_kg)
 }
 
 /// Ajusta un perfil carga-velocidad. `None` si hay <2 cargas distintas.
