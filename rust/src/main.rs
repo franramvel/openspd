@@ -20,7 +20,9 @@
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use openspd_core::metrics::{est_1rm_kg, est_1rm_pct, load_zone, summarize, velocity_loss};
+use openspd_core::metrics::{
+    est_1rm_kg, est_1rm_pct_src, load_zone, summarize, velocity_loss, EqSource,
+};
 use openspd_core::profile::Lvp;
 use openspd_core::protocol::{Rep, ENCODER_HOST, ENCODER_PORT};
 use openspd_io::RepEvent;
@@ -32,6 +34,8 @@ struct Args {
     csv: Option<String>,
     exercise: Option<String>,
     load: Option<f64>,
+    bodyweight: Option<f64>,
+    added_load: Option<f64>,
     rest: f64, // segundos sin reps para considerar nueva serie
     profile: Option<Lvp>,
 }
@@ -51,6 +55,8 @@ fn parse_args() -> Args {
         csv: None,
         exercise: None,
         load: None,
+        bodyweight: None,
+        added_load: None,
         rest: 30.0,
         profile: None,
     };
@@ -63,6 +69,8 @@ fn parse_args() -> Args {
             "--csv" => a.csv = it.next(),
             "--exercise" => a.exercise = it.next(),
             "--load" => a.load = it.next().and_then(|v| v.parse().ok()),
+            "--bodyweight" => a.bodyweight = it.next().and_then(|v| v.parse().ok()),
+            "--added-load" | "--lastre" => a.added_load = it.next().and_then(|v| v.parse().ok()),
             "--rest" => a.rest = it.next().and_then(|v| v.parse().ok()).unwrap_or(30.0),
             "--profile" => {
                 if let Some(path) = it.next() {
@@ -76,7 +84,7 @@ fn parse_args() -> Args {
                 }
             }
             "-h" | "--help" => {
-                println!("Uso: openspd [--exercise NOMBRE] [--load KG] [--vl-stop PCT] [--rest SEG] [--csv ARCHIVO] [--host H] [--port P]");
+                println!("Uso: openspd [--exercise NOMBRE] [--load KG] [--bodyweight KG] [--added-load KG] [--vl-stop PCT] [--rest SEG] [--csv ARCHIVO] [--host H] [--port P]");
                 std::process::exit(0);
             }
             other => eprintln!("(aviso) argumento ignorado: {other}"),
@@ -113,15 +121,24 @@ fn print_set_summary(set: u32, reps: &[Rep], args: &Args) {
                 pct, lvp.one_rm_kg, lvp.exercise, lvp.r2
             );
         } else if let Some(ex) = &args.exercise {
-            // ecuacion poblacional
-            if let Some(pct) = est_1rm_pct(ex, s.best_mean_velocity) {
-                print!("  → %1RM estimado ({ex}): {pct:.0}%");
-                if let Some(load) = args.load {
-                    if let Some(rm) = est_1rm_kg(load, pct) {
-                        print!("  ·  1RM ≈ {rm:.0} kg (con {load:.0} kg)");
-                    }
+            // ecuacion poblacional (validada) o estimacion generica sugerida
+            let (pct, src) = est_1rm_pct_src(ex, s.best_mean_velocity);
+            print!("  → %1RM estimado ({ex}): {pct:.0}%");
+            // carga efectiva: en peso corporal es peso corporal + lastre; si no, --load
+            let load = if openspd_core::profile::is_bodyweight(ex) {
+                args.bodyweight
+                    .map(|bw| openspd_core::profile::total_bodyweight_load(bw, args.added_load.unwrap_or(0.0)))
+            } else {
+                args.load
+            };
+            if let Some(load) = load {
+                if let Some(rm) = est_1rm_kg(load, pct) {
+                    print!("  ·  1RM ≈ {rm:.0} kg (con {load:.0} kg)");
                 }
-                println!("  [aproximado/poblacional]");
+            }
+            match src {
+                EqSource::Validada => println!("  [poblacional validada]"),
+                EqSource::Generica => println!("  [genérica sugerida · usa tu perfil]"),
             }
         }
         println!();

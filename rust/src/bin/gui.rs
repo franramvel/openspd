@@ -21,7 +21,17 @@ use openspd_core::profile::{self, default_v1rm, Lvp, Point};
 use openspd_core::protocol::{Rep, ENCODER_HOST, ENCODER_PORT};
 use openspd_io::RepEvent;
 
-const EXERCISES: [&str; 3] = ["sentadilla", "banca", "peso muerto"];
+// Para dominada/fondo la carga es la TOTAL = peso corporal + lastre (ver profile::is_bodyweight).
+const EXERCISES: [&str; 8] = [
+    "sentadilla",
+    "banca",
+    "peso muerto",
+    "press militar",
+    "remo",
+    "hip thrust",
+    "dominada",
+    "fondo",
+];
 
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -31,6 +41,9 @@ struct GuiApp {
     exercise: String,
     v1rm: f64,
     load: f64,
+    // ejercicios de peso corporal (dominada, fondo): la carga total = peso corporal + lastre
+    bodyweight_kg: f64,
+    added_load_kg: f64,
     rest_secs: f64,
     status: String,
     msg: String,
@@ -58,14 +71,25 @@ impl GuiApp {
         self.lvp = profile::fit(&self.exercise, self.points.clone(), self.v1rm);
     }
 
+    /// Carga total usada para el perfil. En ejercicios de peso corporal es peso corporal + lastre;
+    /// en el resto, la carga única editable.
+    fn current_load(&self) -> f64 {
+        if profile::is_bodyweight(&self.exercise) {
+            profile::total_bodyweight_load(self.bodyweight_kg, self.added_load_kg)
+        } else {
+            self.load
+        }
+    }
+
     fn finalize_set(&mut self) {
         if self.current_set.is_empty() {
             return;
         }
         let best = self.current_set.iter().map(|r| r.mean_velocity).fold(f64::MIN, f64::max);
-        self.points.push(Point { load_kg: self.load, best_velocity: best });
+        let load = self.current_load();
+        self.points.push(Point { load_kg: load, best_velocity: best });
         self.refit();
-        self.msg = format!("Serie {} → punto ({:.1} kg, {:.2} m/s)", self.set_idx, self.load, best);
+        self.msg = format!("Serie {} → punto ({:.1} kg, {:.2} m/s)", self.set_idx, load, best);
         self.set_idx += 1;
         self.current_set.clear();
         self.last_rep = None;
@@ -275,12 +299,23 @@ impl GuiApp {
                         }
                     });
                 ui.separator();
-                ui.label("Carga (kg):");
-                if ui.button("−10").clicked() { self.load = (self.load - 10.0).max(0.0); }
-                if ui.button("−2.5").clicked() { self.load = (self.load - 2.5).max(0.0); }
-                ui.add(egui::DragValue::new(&mut self.load).speed(0.5).range(0.0..=600.0).suffix(" kg"));
-                if ui.button("+2.5").clicked() { self.load += 2.5; }
-                if ui.button("+10").clicked() { self.load += 10.0; }
+                if profile::is_bodyweight(&self.exercise) {
+                    // peso corporal + lastre (el lastre puede ser negativo si hay asistencia)
+                    ui.label("Peso corporal (kg):");
+                    ui.add(egui::DragValue::new(&mut self.bodyweight_kg).speed(0.5).range(0.0..=300.0).suffix(" kg"));
+                    ui.label("Lastre (kg):");
+                    if ui.button("−2.5").clicked() { self.added_load_kg -= 2.5; }
+                    ui.add(egui::DragValue::new(&mut self.added_load_kg).speed(0.5).range(-100.0..=300.0).suffix(" kg"));
+                    if ui.button("+2.5").clicked() { self.added_load_kg += 2.5; }
+                    ui.label(egui::RichText::new(format!("= {:.1} kg total", self.current_load())).strong());
+                } else {
+                    ui.label("Carga (kg):");
+                    if ui.button("−10").clicked() { self.load = (self.load - 10.0).max(0.0); }
+                    if ui.button("−2.5").clicked() { self.load = (self.load - 2.5).max(0.0); }
+                    ui.add(egui::DragValue::new(&mut self.load).speed(0.5).range(0.0..=600.0).suffix(" kg"));
+                    if ui.button("+2.5").clicked() { self.load += 2.5; }
+                    if ui.button("+10").clicked() { self.load += 10.0; }
+                }
                 ui.separator();
                 if ui.button("▶ Iniciar serie (cuenta atrás)").clicked() { self.start_countdown(); }
                 if ui.button("Cerrar serie").clicked() { self.finalize_set(); }
@@ -327,7 +362,7 @@ impl GuiApp {
                 return;
             }
 
-            ui.heading(format!("Serie actual · {} reps · {:.1} kg", self.current_set.len(), self.load));
+            ui.heading(format!("Serie actual · {} reps · {:.1} kg", self.current_set.len(), self.current_load()));
 
             // velocity loss
             let vl = velocity_loss(&self.current_set);
@@ -434,6 +469,8 @@ impl GuiApp {
 struct Args {
     exercise: String,
     load: f64,
+    bodyweight: f64,
+    added_load: f64,
     prep: f64,
     csv: Option<String>,
     profile_path: Option<String>,
@@ -444,6 +481,8 @@ fn parse_args() -> Args {
     let mut a = Args {
         exercise: "sentadilla".into(),
         load: 20.0,
+        bodyweight: 75.0,
+        added_load: 0.0,
         prep: 5.0,
         csv: None,
         profile_path: None,
@@ -454,6 +493,8 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--exercise" => a.exercise = it.next().unwrap_or(a.exercise),
             "--load" => a.load = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.load),
+            "--bodyweight" => a.bodyweight = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.bodyweight),
+            "--added-load" | "--lastre" => a.added_load = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.added_load),
             "--prep" => a.prep = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.prep),
             "--csv" => a.csv = it.next(),
             "--profile" => {
@@ -483,6 +524,8 @@ fn main() -> eframe::Result<()> {
         exercise: args.exercise,
         v1rm,
         load: args.load,
+        bodyweight_kg: args.bodyweight,
+        added_load_kg: args.added_load,
         rest_secs: 20.0,
         prep_secs: args.prep,
         countdown_until: None,
