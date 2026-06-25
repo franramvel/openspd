@@ -56,6 +56,8 @@ ratatui = "0.29"
 crossterm = "0.28"
 eframe = "0.29"
 egui_plot = "0.29"
+# audio del GUI: beeps de cuenta atrás y alarma de velocidad (tonos generados por software)
+rodio = { version = "0.20", default-features = false }
 
 [profile.release]
 opt-level = 3

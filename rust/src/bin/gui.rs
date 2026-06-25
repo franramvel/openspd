@@ -64,11 +64,30 @@ struct GuiApp {
     scanning: bool,
     scan_rx: Option<Receiver<Result<Vec<(String, String)>, String>>>,
     scan_results: Vec<(String, String)>,
+    // audio: beeps de cuenta atrás y alarma al perder la velocidad objetivo
+    _audio_stream: Option<rodio::OutputStream>, // mantener vivo o el sonido se corta
+    audio: Option<rodio::OutputStreamHandle>,
+    // pérdida de velocidad objetivo (%): al superarla suena la alarma
+    vl_target: f64,
+    last_count_shown: Option<i64>, // último número de la cuenta atrás que ya sonó
+    vl_alarm_fired: bool,          // la alarma suena una sola vez por serie
 }
 
 impl GuiApp {
     fn refit(&mut self) {
         self.lvp = profile::fit(&self.exercise, self.points.clone(), self.v1rm);
+    }
+
+    /// Reproduce un tono senoidal generado por software (sin archivos de audio).
+    /// Silencioso si no hay dispositivo de salida.
+    fn play_tone(&self, freq: f32, ms: u64, amp: f32) {
+        use rodio::Source;
+        if let Some(h) = &self.audio {
+            let src = rodio::source::SineWave::new(freq)
+                .take_duration(Duration::from_millis(ms))
+                .amplify(amp);
+            let _ = h.play_raw(src.convert_samples());
+        }
     }
 
     /// Carga total usada para el perfil. En ejercicios de peso corporal es peso corporal + lastre;
@@ -93,6 +112,7 @@ impl GuiApp {
         self.set_idx += 1;
         self.current_set.clear();
         self.last_rep = None;
+        self.vl_alarm_fired = false; // la próxima serie podrá volver a disparar la alarma
     }
 
     fn add_rep(&mut self, rep: Rep) {
@@ -108,6 +128,8 @@ impl GuiApp {
         self.current_set.clear();
         self.last_rep = None;
         self.countdown_until = Some(Instant::now() + Duration::from_secs_f64(self.prep_secs));
+        self.last_count_shown = None; // que el primer número de la cuenta atrás vuelva a sonar
+        self.vl_alarm_fired = false;
         self.msg = format!("Prepárate… la serie empieza en {:.0} s", self.prep_secs);
     }
 
@@ -168,11 +190,24 @@ impl eframe::App for GuiApp {
             Some(end) if Instant::now() < end => true,
             Some(_) => {
                 self.countdown_until = None;
+                self.last_count_shown = None;
                 self.msg = "¡Ya! Empieza la serie.".into();
+                self.play_tone(1320.0, 350, 0.25); // tono final, distinto del beep: ¡empieza!
                 false
             }
             None => false,
         };
+
+        // beep en cada número de la cuenta atrás (5·4·3·2·1), una sola vez por número
+        if counting_down {
+            if let Some(rem) = self.countdown_remaining() {
+                let n = rem.ceil() as i64;
+                if Some(n) != self.last_count_shown {
+                    self.last_count_shown = Some(n);
+                    self.play_tone(880.0, 120, 0.20);
+                }
+            }
+        }
 
         // drenar canal de la conexión activa (recoger primero para evitar conflicto de borrow)
         let mut incoming = Vec::new();
@@ -193,6 +228,14 @@ impl eframe::App for GuiApp {
                 RepEvent::Closed => self.status = "conexión cerrada por el encoder".into(),
             }
         }
+        // alarma al superar la pérdida de velocidad objetivo de la serie (una vez por serie)
+        if !counting_down && !self.current_set.is_empty() && !self.vl_alarm_fired {
+            if velocity_loss(&self.current_set) >= self.vl_target {
+                self.vl_alarm_fired = true;
+                self.play_tone(440.0, 600, 0.30); // alarma grave y larga, distinta del beep
+            }
+        }
+
         // cierre de serie por descanso (no mientras nos preparamos)
         if !counting_down {
             if let Some(t) = self.last_rep {
@@ -277,6 +320,8 @@ impl GuiApp {
         self.current_set.clear();
         self.last_rep = None;
         self.countdown_until = None;
+        self.last_count_shown = None;
+        self.vl_alarm_fired = false;
         self.scanning = false;
         self.scan_rx = None;
         self.scan_results.clear();
@@ -334,6 +379,9 @@ impl GuiApp {
                 ui.label("Descanso para cerrar serie:");
                 ui.add(egui::DragValue::new(&mut self.rest_secs).speed(1.0).range(3.0..=180.0).suffix(" s"));
                 ui.separator();
+                ui.label("Pérdida objetivo (alarma):");
+                ui.add(egui::DragValue::new(&mut self.vl_target).speed(1.0).range(5.0..=50.0).suffix(" %"));
+                ui.separator();
                 ui.label(egui::RichText::new(&self.msg).weak());
             });
         });
@@ -364,19 +412,19 @@ impl GuiApp {
 
             ui.heading(format!("Serie actual · {} reps · {:.1} kg", self.current_set.len(), self.current_load()));
 
-            // velocity loss
+            // velocity loss (el umbral rojo coincide con la pérdida objetivo / alarma)
             let vl = velocity_loss(&self.current_set);
-            let color = if vl >= 30.0 {
+            let color = if vl >= self.vl_target {
                 egui::Color32::from_rgb(220, 60, 60)
-            } else if vl >= 20.0 {
+            } else if vl >= self.vl_target * 0.6 {
                 egui::Color32::from_rgb(220, 180, 60)
             } else {
                 egui::Color32::from_rgb(60, 200, 100)
             };
             ui.horizontal(|ui| {
                 ui.label("Velocity loss:");
-                ui.add(egui::ProgressBar::new((vl / 40.0).clamp(0.0, 1.0) as f32)
-                    .text(format!("{vl:.1} %"))
+                ui.add(egui::ProgressBar::new((vl / (self.vl_target * 1.5).max(1.0)).clamp(0.0, 1.0) as f32)
+                    .text(format!("{vl:.1} % / {:.0} %", self.vl_target))
                     .fill(color));
             });
 
@@ -520,6 +568,12 @@ fn main() -> eframe::Result<()> {
     let points = args.loaded.as_ref().map(|l| l.points.clone()).unwrap_or_default();
     let lvp = args.loaded;
 
+    // salida de audio para los beeps/alarma; si no hay dispositivo, el GUI va en silencio
+    let (audio_stream, audio_handle) = match rodio::OutputStream::try_default() {
+        Ok((s, h)) => (Some(s), Some(h)),
+        Err(_) => (None, None),
+    };
+
     let app = GuiApp {
         exercise: args.exercise,
         v1rm,
@@ -543,6 +597,11 @@ fn main() -> eframe::Result<()> {
         scanning: false,
         scan_rx: None,
         scan_results: Vec::new(),
+        _audio_stream: audio_stream,
+        audio: audio_handle,
+        vl_target: 20.0,
+        last_count_shown: None,
+        vl_alarm_fired: false,
     };
 
     let opts = eframe::NativeOptions {
