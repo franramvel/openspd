@@ -9,7 +9,9 @@ OpenSPD es software independiente, sin relación ni respaldo de los fabricantes 
 
 **Requisitos:** toolchain de **Rust** (`cargo`). Probado en **Linux** (los comandos de red usan
 NetworkManager/`nmcli`, y el encoder v2 usa BlueZ/`libdbus`). En Windows/macOS el bloque de `nmcli`
-no aplica tal cual.
+no aplica tal cual. El **GUI** emite beeps de cuenta atrás y una alarma de velocidad, por lo que en
+Linux necesita las cabeceras de **ALSA** al compilar (`libasound2-dev` en Debian/Ubuntu, `alsa-lib`
+en Arch); si no hay dispositivo de audio en ejecución, el GUI funciona en silencio.
 
 **Dispositivos probados:** un encoder VBT de **1ª generación, solo WiFi** (el v1) y un encoder **BLE**
 (el v2), ambos en posesión del autor del proyecto. ⚠️ Los modelos comerciales **actuales** (p. ej. el
