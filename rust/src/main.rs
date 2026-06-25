@@ -38,6 +38,7 @@ struct Args {
     added_load: Option<f64>,
     rest: f64, // segundos sin reps para considerar nueva serie
     profile: Option<Lvp>,
+    user: Option<String>,
 }
 
 /// Rep + numero de serie + timestamp unix, para el registro/CSV.
@@ -59,6 +60,7 @@ fn parse_args() -> Args {
         added_load: None,
         rest: 30.0,
         profile: None,
+        user: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -67,6 +69,7 @@ fn parse_args() -> Args {
             "--port" => a.port = it.next().and_then(|v| v.parse().ok()).unwrap_or(ENCODER_PORT),
             "--vl-stop" => a.vl_stop = it.next().and_then(|v| v.parse().ok()),
             "--csv" => a.csv = it.next(),
+            "--user" => a.user = it.next(),
             "--exercise" => a.exercise = it.next(),
             "--load" => a.load = it.next().and_then(|v| v.parse().ok()),
             "--bodyweight" => a.bodyweight = it.next().and_then(|v| v.parse().ok()),
@@ -84,7 +87,7 @@ fn parse_args() -> Args {
                 }
             }
             "-h" | "--help" => {
-                println!("Uso: openspd [--exercise NOMBRE] [--load KG] [--bodyweight KG] [--added-load KG] [--vl-stop PCT] [--rest SEG] [--csv ARCHIVO] [--host H] [--port P]");
+                println!("Uso: openspd [--user NOMBRE] [--exercise NOMBRE] [--load KG] [--bodyweight KG] [--added-load KG] [--vl-stop PCT] [--rest SEG] [--csv ARCHIVO] [--host H] [--port P]");
                 std::process::exit(0);
             }
             other => eprintln!("(aviso) argumento ignorado: {other}"),
@@ -153,11 +156,26 @@ fn main() {
          entrenas bajo tu propia responsabilidad.",
         env!("CARGO_PKG_VERSION")
     );
-    let args = parse_args();
-    let csv_path = args
-        .csv
-        .clone()
-        .unwrap_or_else(|| format!("sesion_{}.csv", now_unix()));
+    let mut args = parse_args();
+    // usuario activo: --user o "default" (creado de forma idempotente). Enruta CSV y perfil.
+    let slug = openspd_io::users::add_user(args.user.as_deref().unwrap_or("default"))
+        .map(|u| u.slug)
+        .unwrap_or_else(|_| "default".into());
+    let csv_path = args.csv.clone().unwrap_or_else(|| {
+        openspd_io::users::session_csv_path_for(&slug, now_unix())
+            .unwrap_or_else(|_| format!("sesion_{}.csv", now_unix()))
+    });
+    // si no se pasó --profile pero sí --exercise, intenta el perfil del usuario para ese ejercicio
+    if args.profile.is_none() {
+        if let Some(ex) = args.exercise.clone() {
+            if let Ok(p) = openspd_io::users::profile_path_for(&slug, &ex) {
+                if let Ok(lvp) = openspd_io::load_profile(&p) {
+                    eprintln!("Perfil de '{slug}' cargado: {} · 1RM {:.0} kg · R² {:.3}", lvp.exercise, lvp.one_rm_kg, lvp.r2);
+                    args.profile = Some(lvp);
+                }
+            }
+        }
+    }
 
     println!(
         "Conectando a {}:{} ... (Ctrl-C para terminar)",

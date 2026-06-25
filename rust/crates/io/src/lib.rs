@@ -15,6 +15,8 @@
 //! En MÓVIL este crate no se usa: Android/iOS hacen el TCP/BLE nativo y llaman a `openspd-core`
 //! (p. ej. `Reassembler::push` + `parse_repetition` para v2, `parse_line` para v1).
 
+pub mod users;
+
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::mpsc::{self, Receiver};

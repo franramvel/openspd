@@ -10,6 +10,7 @@
 //! Uso:  cargo run --release --bin openspd-gui
 //!       (opcional)  --exercise sentadilla  --load 40  --profile sentadilla.lvp
 
+use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -80,6 +81,27 @@ struct GuiApp {
     vl_target: f64,
     last_count_shown: Option<i64>, // último número de la cuenta atrás que ya sonó
     vl_alarm_fired: bool,          // la alarma suena una sola vez por serie
+    // multiusuario: usuario activo (slug), registro cacheado y buffer del campo "añadir"
+    active_user: String,
+    users: Vec<openspd_io::users::User>,
+    new_user_buf: String,
+    show_users: bool,
+    // estado de sesión de cada usuario NO activo, para no perder series/reps al cambiar
+    sessions: HashMap<String, UserSession>,
+}
+
+/// Estado de la sesión de un usuario que se conserva al cambiar de usuario (series, reps, perfil).
+struct UserSession {
+    exercise: String,
+    v1rm: f64,
+    set_idx: u32,
+    current_set: Vec<Rep>,
+    log: Vec<(u32, Rep, u64)>,
+    points: Vec<Point>,
+    point_set: Vec<Option<u32>>,
+    lvp: Option<Lvp>,
+    csv_path: String,
+    profile_path: String,
 }
 
 impl GuiApp {
@@ -242,7 +264,185 @@ impl GuiApp {
         if self.exercise != ex {
             self.exercise = ex.to_string();
             self.v1rm = default_v1rm(ex);
-            self.refit();
+            // el perfil es por (usuario, ejercicio): re-apuntar y recargar el del nuevo ejercicio
+            self.load_user_profile();
+        }
+    }
+
+    // ─────────────────────────── multiusuario ───────────────────────────
+
+    /// Recarga el registro de usuarios desde disco.
+    fn refresh_users(&mut self) {
+        self.users = openspd_io::users::list_users().unwrap_or_default();
+    }
+
+    /// Nombre visible del usuario activo (cae al slug si no está en el registro).
+    fn active_display(&self) -> String {
+        self.users
+            .iter()
+            .find(|u| u.slug == self.active_user)
+            .map(|u| u.display.clone())
+            .unwrap_or_else(|| self.active_user.clone())
+    }
+
+    /// Añade el usuario tecleado en el campo, lo refresca y limpia el buffer.
+    fn add_user_from_buf(&mut self) {
+        let name = self.new_user_buf.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        match openspd_io::users::add_user(&name) {
+            Ok(u) => {
+                self.new_user_buf.clear();
+                self.refresh_users();
+                self.msg = format!("Usuario añadido: {}", u.display);
+            }
+            Err(e) => self.msg = format!("No se pudo añadir el usuario: {e}"),
+        }
+    }
+
+    /// Re-apunta `profile_path` al perfil del usuario+ejercicio actuales y lo carga (o limpia).
+    fn load_user_profile(&mut self) {
+        match openspd_io::users::profile_path_for(&self.active_user, &self.exercise) {
+            Ok(p) => self.profile_path = p,
+            Err(_) => self.profile_path = format!("{}.lvp", self.exercise),
+        }
+        match openspd_io::load_profile(&self.profile_path) {
+            Ok(l) => {
+                self.v1rm = l.v1rm;
+                self.points = l.points.clone();
+                self.point_set = vec![None; self.points.len()];
+                self.lvp = Some(l);
+            }
+            Err(_) => {
+                self.points.clear();
+                self.point_set.clear();
+                self.v1rm = default_v1rm(&self.exercise);
+                self.refit();
+            }
+        }
+    }
+
+    /// Captura el estado de sesión del usuario activo (para conservarlo al cambiar).
+    fn snapshot_session(&self) -> UserSession {
+        UserSession {
+            exercise: self.exercise.clone(),
+            v1rm: self.v1rm,
+            set_idx: self.set_idx,
+            current_set: self.current_set.clone(),
+            log: self.log.clone(),
+            points: self.points.clone(),
+            point_set: self.point_set.clone(),
+            lvp: self.lvp.clone(),
+            csv_path: self.csv_path.clone(),
+            profile_path: self.profile_path.clone(),
+        }
+    }
+
+    /// Restaura un estado de sesión previamente guardado (al volver a un usuario).
+    fn restore_session(&mut self, s: UserSession) {
+        self.exercise = s.exercise;
+        self.v1rm = s.v1rm;
+        self.set_idx = s.set_idx;
+        self.current_set = s.current_set;
+        self.log = s.log;
+        self.points = s.points;
+        self.point_set = s.point_set;
+        self.lvp = s.lvp;
+        self.csv_path = s.csv_path;
+        self.profile_path = s.profile_path;
+    }
+
+    /// Inicia una sesión nueva para un usuario sin estado previo en esta ejecución: CSV nuevo y
+    /// su perfil cargado de disco.
+    fn init_fresh_session(&mut self, slug: &str) {
+        self.set_idx = 1;
+        self.current_set.clear();
+        self.log.clear();
+        self.csv_path = openspd_io::users::session_csv_path_for(slug, now_unix())
+            .unwrap_or_else(|_| format!("sesion_{}.csv", now_unix()));
+        self.load_user_profile();
+    }
+
+    /// Cambia de usuario activo conservando el estado de cada uno: guarda en disco y memoriza la
+    /// sesión del usuario que se deja, y restaura (o inicia) la del usuario entrante. Nunca mezcla
+    /// las series/reps de un usuario con las de otro.
+    fn switch_user(&mut self, slug: &str) {
+        if self.active_user == slug {
+            self.show_users = false;
+            return;
+        }
+        // volcar a disco y memorizar la sesión del usuario saliente
+        self.save_all();
+        let snap = self.snapshot_session();
+        self.sessions.insert(self.active_user.clone(), snap);
+        // timers/alarmas no se transfieren entre usuarios
+        self.last_rep = None;
+        self.countdown_until = None;
+        self.last_count_shown = None;
+        self.vl_alarm_fired = false;
+        // entrar al nuevo usuario: restaurar su estado si ya entrenó en esta sesión, o iniciar uno
+        self.active_user = slug.to_string();
+        match self.sessions.remove(slug) {
+            Some(s) => self.restore_session(s),
+            None => self.init_fresh_session(slug),
+        }
+        self.show_users = false;
+        self.msg = format!("Usuario activo: {}", self.active_display());
+    }
+
+    /// Ventana de gestión de usuarios: lista (con el activo marcado), añadir y quitar.
+    fn users_window(&mut self, ctx: &egui::Context) {
+        if !self.show_users {
+            return;
+        }
+        let mut open = self.show_users;
+        let mut switch_to: Option<String> = None;
+        let mut remove: Option<String> = None;
+        egui::Window::new("👤 Usuarios")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Cada usuario guarda sus series y su perfil por separado.");
+                ui.separator();
+                for u in self.users.clone() {
+                    ui.horizontal(|ui| {
+                        let is_active = u.slug == self.active_user;
+                        let label = if is_active {
+                            format!("● {}", u.display)
+                        } else {
+                            u.display.clone()
+                        };
+                        if ui.selectable_label(is_active, label).clicked() {
+                            switch_to = Some(u.slug.clone());
+                        }
+                        // no permitir quitar el usuario activo
+                        if !is_active && ui.small_button("🗑").on_hover_text("Quitar del registro").clicked() {
+                            remove = Some(u.slug.clone());
+                        }
+                    });
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Nuevo:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.new_user_buf)
+                            .hint_text("nombre del usuario"),
+                    );
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Añadir").clicked() || enter {
+                        self.add_user_from_buf();
+                    }
+                });
+            });
+        self.show_users = open;
+        if let Some(slug) = switch_to {
+            self.switch_user(&slug);
+        } else if let Some(slug) = remove {
+            let _ = openspd_io::users::remove_user(&slug, false);
+            self.refresh_users();
+            self.msg = "Usuario quitado del registro (sus ficheros se conservan)".into();
         }
     }
 }
@@ -339,6 +539,7 @@ impl eframe::App for GuiApp {
         self.controls(ctx);
         self.profile_panel(ctx);
         self.current_set_panel(ctx);
+        self.users_window(ctx);
     }
 }
 
@@ -394,6 +595,11 @@ impl GuiApp {
                 if ui.button("⟵ Cambiar encoder").clicked() {
                     self.disconnect_to_select();
                 }
+                if ui.button("👤 Usuarios").clicked() {
+                    self.refresh_users();
+                    self.show_users = !self.show_users;
+                }
+                ui.label(format!("Usuario: {}", self.active_display()));
                 ui.separator();
                 ui.label(format!("Serie {}", self.set_idx));
                 ui.separator();
@@ -663,6 +869,7 @@ struct Args {
     csv: Option<String>,
     profile_path: Option<String>,
     loaded: Option<Lvp>,
+    user: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -675,6 +882,7 @@ fn parse_args() -> Args {
         csv: None,
         profile_path: None,
         loaded: None,
+        user: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -684,6 +892,7 @@ fn parse_args() -> Args {
             "--bodyweight" => a.bodyweight = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.bodyweight),
             "--added-load" | "--lastre" => a.added_load = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.added_load),
             "--prep" => a.prep = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.prep),
+            "--user" => a.user = it.next(),
             "--csv" => a.csv = it.next(),
             "--profile" => {
                 if let Some(p) = it.next() {
@@ -702,12 +911,30 @@ fn parse_args() -> Args {
 
 fn main() -> eframe::Result<()> {
     let args = parse_args();
-    let csv_path = args.csv.unwrap_or_else(|| format!("sesion_{}.csv", now_unix()));
-    let profile_path = args.profile_path.unwrap_or_else(|| format!("{}.lvp", args.exercise));
-    let v1rm = args.loaded.as_ref().map(|l| l.v1rm).unwrap_or_else(|| default_v1rm(&args.exercise));
-    let points = args.loaded.as_ref().map(|l| l.points.clone()).unwrap_or_default();
+    // usuario activo: --user o "default" (creado de forma idempotente)
+    let user = openspd_io::users::add_user(args.user.as_deref().unwrap_or("default"))
+        .unwrap_or(openspd_io::users::User { slug: "default".into(), display: "default".into() });
+
+    // perfil: un --profile explícito gana; si no, el del (usuario, ejercicio) actual
+    let (profile_path, loaded) = match (args.profile_path, args.loaded) {
+        (Some(p), l) => (p, l),
+        (None, _) => {
+            let p = openspd_io::users::profile_path_for(&user.slug, &args.exercise)
+                .unwrap_or_else(|_| format!("{}.lvp", args.exercise));
+            let l = openspd_io::load_profile(&p).ok();
+            (p, l)
+        }
+    };
+    let csv_path = args.csv.unwrap_or_else(|| {
+        openspd_io::users::session_csv_path_for(&user.slug, now_unix())
+            .unwrap_or_else(|_| format!("sesion_{}.csv", now_unix()))
+    });
+    let exercise = loaded.as_ref().map(|l| l.exercise.clone()).unwrap_or(args.exercise);
+    let v1rm = loaded.as_ref().map(|l| l.v1rm).unwrap_or_else(|| default_v1rm(&exercise));
+    let points = loaded.as_ref().map(|l| l.points.clone()).unwrap_or_default();
     let point_set = vec![None; points.len()]; // los puntos precargados no tienen reps en el log
-    let lvp = args.loaded;
+    let lvp = loaded;
+    let users = openspd_io::users::list_users().unwrap_or_default();
 
     // salida de audio para los beeps/alarma; si no hay dispositivo, el GUI va en silencio
     let (audio_stream, audio_handle) = match rodio::OutputStream::try_default() {
@@ -716,7 +943,7 @@ fn main() -> eframe::Result<()> {
     };
 
     let app = GuiApp {
-        exercise: args.exercise,
+        exercise,
         v1rm,
         load: args.load,
         bodyweight_kg: args.bodyweight,
@@ -744,6 +971,11 @@ fn main() -> eframe::Result<()> {
         vl_target: 20.0,
         last_count_shown: None,
         vl_alarm_fired: false,
+        active_user: user.slug,
+        users,
+        new_user_buf: String::new(),
+        show_users: false,
+        sessions: HashMap::new(),
     };
 
     let opts = eframe::NativeOptions {

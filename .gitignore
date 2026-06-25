@@ -23,6 +23,8 @@ target
 # OpenSPD: datos generados / personales (sesiones, perfiles)
 *.csv
 *.lvp
+# multiusuario: directorio por persona con sus sesiones, perfiles y el registro
+users/
 
 # Python
 __pycache__/

@@ -26,10 +26,11 @@ struct Args {
     scan_secs: u64,
     send_begin: bool,
     csv: Option<String>,
+    user: Option<String>,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { address: None, scan_secs: DEFAULT_SCAN_SECS, send_begin: true, csv: None };
+    let mut a = Args { address: None, scan_secs: DEFAULT_SCAN_SECS, send_begin: true, csv: None, user: None };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -37,8 +38,9 @@ fn parse_args() -> Args {
             "--scan-secs" => a.scan_secs = it.next().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SCAN_SECS),
             "--no-begin" => a.send_begin = false,
             "--csv" => a.csv = it.next(),
+            "--user" => a.user = it.next(),
             "-h" | "--help" => {
-                println!("Uso: openspd-ble [--address MAC] [--scan-secs N] [--no-begin] [--csv ARCHIVO]");
+                println!("Uso: openspd-ble [--user NOMBRE] [--address MAC] [--scan-secs N] [--no-begin] [--csv ARCHIVO]");
                 std::process::exit(0);
             }
             _ => {}
@@ -78,7 +80,14 @@ fn main() {
         env!("CARGO_PKG_VERSION")
     );
     let args = parse_args();
-    let csv_path = args.csv.clone().unwrap_or_else(|| format!("sesion_ble_{}.csv", now_unix()));
+    // usuario activo: --user o "default" (creado de forma idempotente). Enruta el CSV.
+    let slug = openspd_io::users::add_user(args.user.as_deref().unwrap_or("default"))
+        .map(|u| u.slug)
+        .unwrap_or_else(|_| "default".into());
+    let csv_path = args.csv.clone().unwrap_or_else(|| {
+        openspd_io::users::ble_csv_path_for(&slug, now_unix())
+            .unwrap_or_else(|_| format!("sesion_ble_{}.csv", now_unix()))
+    });
 
     // Elegir dirección: directa (--address) o por escaneo + selector.
     let address = match args.address.clone() {

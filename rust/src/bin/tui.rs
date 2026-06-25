@@ -16,6 +16,7 @@
 //!   openspd-tui --exercise dominada --bodyweight 78 --lastre 20   (carga total = 98 kg)
 //!   openspd-tui --profile sentadilla.lvp        (carga un perfil existente para seguir)
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -64,6 +65,28 @@ struct App {
     scanning: bool,
     scan_rx: Option<Receiver<Result<Vec<(String, String)>, String>>>,
     scan_results: Vec<(String, String)>,
+    // multiusuario
+    active_user: String,
+    users: Vec<openspd_io::users::User>,
+    user_input: String,
+    user_screen: bool,
+    user_sel: usize,
+    // estado de sesión de cada usuario NO activo, para no perder series/reps al cambiar
+    sessions: HashMap<String, UserSession>,
+}
+
+/// Estado de la sesión de un usuario que se conserva al cambiar de usuario (series, reps, perfil).
+struct UserSession {
+    exercise: String,
+    v1rm: f64,
+    set_idx: u32,
+    current_set: Vec<Rep>,
+    log: Vec<(u32, Rep, u64)>,
+    points: Vec<Point>,
+    point_set: Vec<Option<u32>>,
+    lvp: Option<Lvp>,
+    csv_path: String,
+    profile_path: String,
 }
 
 impl App {
@@ -301,6 +324,126 @@ impl App {
         self.status = "elige un encoder".into();
         self.msg = "Desconectado. Elige encoder: 'w' WiFi · 'e' escanear BLE · 'q' salir".into();
     }
+
+    // ─────────────────────────── multiusuario ───────────────────────────
+
+    fn refresh_users(&mut self) {
+        self.users = openspd_io::users::list_users().unwrap_or_default();
+        if self.user_sel >= self.users.len() {
+            self.user_sel = self.users.len().saturating_sub(1);
+        }
+    }
+
+    /// Nombre visible del usuario activo (cae al slug si no está en el registro).
+    fn active_display(&self) -> String {
+        self.users
+            .iter()
+            .find(|u| u.slug == self.active_user)
+            .map(|u| u.display.clone())
+            .unwrap_or_else(|| self.active_user.clone())
+    }
+
+    /// Añade el usuario tecleado y limpia el campo.
+    fn add_user_typed(&mut self) {
+        let name = self.user_input.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        match openspd_io::users::add_user(&name) {
+            Ok(u) => {
+                self.user_input.clear();
+                self.refresh_users();
+                self.msg = format!("Usuario añadido: {}", u.display);
+            }
+            Err(e) => self.msg = format!("No se pudo añadir el usuario: {e}"),
+        }
+    }
+
+    /// Re-apunta `profile_path` al perfil del usuario+ejercicio actuales y lo carga (o limpia).
+    fn load_user_profile(&mut self) {
+        match openspd_io::users::profile_path_for(&self.active_user, &self.exercise) {
+            Ok(p) => self.profile_path = p,
+            Err(_) => self.profile_path = format!("{}.lvp", self.exercise),
+        }
+        match openspd_io::load_profile(&self.profile_path) {
+            Ok(l) => {
+                self.v1rm = l.v1rm;
+                self.points = l.points.clone();
+                self.point_set = vec![None; self.points.len()];
+                self.lvp = Some(l);
+            }
+            Err(_) => {
+                self.points.clear();
+                self.point_set.clear();
+                self.v1rm = default_v1rm(&self.exercise);
+                self.refit();
+            }
+        }
+    }
+
+    /// Captura el estado de sesión del usuario activo (para conservarlo al cambiar).
+    fn snapshot_session(&self) -> UserSession {
+        UserSession {
+            exercise: self.exercise.clone(),
+            v1rm: self.v1rm,
+            set_idx: self.set_idx,
+            current_set: self.current_set.clone(),
+            log: self.log.clone(),
+            points: self.points.clone(),
+            point_set: self.point_set.clone(),
+            lvp: self.lvp.clone(),
+            csv_path: self.csv_path.clone(),
+            profile_path: self.profile_path.clone(),
+        }
+    }
+
+    /// Restaura un estado de sesión previamente guardado (al volver a un usuario).
+    fn restore_session(&mut self, s: UserSession) {
+        self.exercise = s.exercise;
+        self.v1rm = s.v1rm;
+        self.set_idx = s.set_idx;
+        self.current_set = s.current_set;
+        self.log = s.log;
+        self.points = s.points;
+        self.point_set = s.point_set;
+        self.lvp = s.lvp;
+        self.csv_path = s.csv_path;
+        self.profile_path = s.profile_path;
+    }
+
+    /// Inicia una sesión nueva para un usuario sin estado previo en esta ejecución.
+    fn init_fresh_session(&mut self, slug: &str) {
+        self.set_idx = 1;
+        self.current_set.clear();
+        self.log.clear();
+        self.csv_path = openspd_io::users::session_csv_path_for(slug, now_unix())
+            .unwrap_or_else(|_| format!("sesion_{}.csv", now_unix()));
+        self.load_user_profile();
+    }
+
+    /// Cambia de usuario activo conservando el estado de cada uno: guarda en disco y memoriza la
+    /// sesión del usuario que se deja, y restaura (o inicia) la del usuario entrante. Nunca mezcla
+    /// las series/reps de un usuario con las de otro.
+    fn switch_user(&mut self, slug: &str) {
+        if self.active_user == slug {
+            self.user_screen = false;
+            return;
+        }
+        self.save_all();
+        let snap = self.snapshot_session();
+        self.sessions.insert(self.active_user.clone(), snap);
+        self.last_rep = None;
+        self.countdown_until = None;
+        self.hist_sel_set = 0;
+        self.hist_sel_rep = None;
+        self.active_user = slug.to_string();
+        match self.sessions.remove(slug) {
+            Some(s) => self.restore_session(s),
+            None => self.init_fresh_session(slug),
+        }
+        self.user_screen = false;
+        self.msg = format!("Usuario activo: {}", self.active_display());
+    }
 }
 
 fn now_unix() -> u64 {
@@ -320,6 +463,7 @@ struct Args {
     csv: Option<String>,
     profile_path: Option<String>,
     loaded: Option<Lvp>,
+    user: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -335,6 +479,7 @@ fn parse_args() -> Args {
     let mut profile_path = None;
     let mut loaded = None;
     let mut v1rm_override: Option<f64> = None;
+    let mut user = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -348,6 +493,7 @@ fn parse_args() -> Args {
             "--rest" => rest = it.next().and_then(|v| v.parse().ok()).unwrap_or(rest),
             "--prep" => prep = it.next().and_then(|v| v.parse().ok()).unwrap_or(prep),
             "--v1rm" => v1rm_override = it.next().and_then(|v| v.parse().ok()),
+            "--user" => user = it.next(),
             "--csv" => csv = it.next(),
             "--profile" => {
                 if let Some(p) = it.next() {
@@ -362,23 +508,42 @@ fn parse_args() -> Args {
         }
     }
     let v1rm = v1rm_override.unwrap_or_else(|| default_v1rm(&exercise));
-    Args { host, port, exercise, v1rm, load, bodyweight, added_load, rest, prep, csv, profile_path, loaded }
+    Args { host, port, exercise, v1rm, load, bodyweight, added_load, rest, prep, csv, profile_path, loaded, user }
 }
 
 fn main() -> io::Result<()> {
     let args = parse_args();
-    let csv_path = args.csv.unwrap_or_else(|| format!("sesion_{}.csv", now_unix()));
-    let profile_path = args.profile_path.unwrap_or_else(|| format!("{}.lvp", args.exercise));
+    // usuario activo: --user o "default" (creado de forma idempotente)
+    let user = openspd_io::users::add_user(args.user.as_deref().unwrap_or("default"))
+        .unwrap_or(openspd_io::users::User { slug: "default".into(), display: "default".into() });
 
-    let (points, lvp) = match args.loaded {
+    // perfil: un --profile explícito gana; si no, el del (usuario, ejercicio) actual
+    let (profile_path, loaded) = match (args.profile_path, args.loaded) {
+        (Some(p), l) => (p, l),
+        (None, _) => {
+            let p = openspd_io::users::profile_path_for(&user.slug, &args.exercise)
+                .unwrap_or_else(|_| format!("{}.lvp", args.exercise));
+            let l = openspd_io::load_profile(&p).ok();
+            (p, l)
+        }
+    };
+    let csv_path = args.csv.unwrap_or_else(|| {
+        openspd_io::users::session_csv_path_for(&user.slug, now_unix())
+            .unwrap_or_else(|_| format!("sesion_{}.csv", now_unix()))
+    });
+    let exercise = loaded.as_ref().map(|l| l.exercise.clone()).unwrap_or(args.exercise);
+    let v1rm = loaded.as_ref().map(|l| l.v1rm).unwrap_or(args.v1rm);
+
+    let (points, lvp) = match loaded {
         Some(l) => (l.points.clone(), Some(l)),
         None => (Vec::new(), None),
     };
     let point_set = vec![None; points.len()]; // los puntos precargados no tienen reps en el log
+    let users = openspd_io::users::list_users().unwrap_or_default();
 
     let mut app = App {
-        exercise: args.exercise,
-        v1rm: args.v1rm,
+        exercise,
+        v1rm,
         load: args.load,
         bodyweight_kg: args.bodyweight,
         added_load_kg: args.added_load,
@@ -403,6 +568,12 @@ fn main() -> io::Result<()> {
         scanning: false,
         scan_rx: None,
         scan_results: Vec::new(),
+        active_user: user.slug,
+        users,
+        user_input: String::new(),
+        user_screen: false,
+        user_sel: 0,
+        sessions: HashMap::new(),
     };
     let _ = (args.host, args.port); // v1 usa el destino por defecto
 
@@ -488,7 +659,9 @@ fn run<B: ratatui::backend::Backend>(
             }
         }
 
-        if app.rx.is_some() {
+        if app.user_screen {
+            terminal.draw(|f| ui_users(f, app))?;
+        } else if app.rx.is_some() {
             terminal.draw(|f| ui(f, app))?;
         } else {
             terminal.draw(|f| ui_select(f, app))?;
@@ -499,11 +672,38 @@ fn run<B: ratatui::backend::Backend>(
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                if app.rx.is_some() {
+                if app.user_screen {
+                    // pantalla de usuarios: flechas navegan, se teclea el nombre nuevo
+                    match k.code {
+                        KeyCode::Esc => app.user_screen = false,
+                        KeyCode::Up => app.user_sel = app.user_sel.saturating_sub(1),
+                        KeyCode::Down => {
+                            if app.user_sel + 1 < app.users.len() {
+                                app.user_sel += 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if !app.user_input.trim().is_empty() {
+                                app.add_user_typed();
+                            } else if let Some(u) = app.users.get(app.user_sel).cloned() {
+                                app.switch_user(&u.slug);
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            app.user_input.pop();
+                        }
+                        KeyCode::Char(c) => app.user_input.push(c),
+                        _ => {}
+                    }
+                } else if app.rx.is_some() {
                     // modo conectado
                     match k.code {
                         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
                         KeyCode::Char('b') => app.disconnect_to_select(),
+                        KeyCode::Char('U') => {
+                            app.refresh_users();
+                            app.user_screen = true;
+                        }
                         // en peso corporal +/- [ ] editan el lastre (puede ser negativo); si no, la carga
                         KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_load(2.5),
                         KeyCode::Char('-') | KeyCode::Char('_') => app.adjust_load(-2.5),
@@ -540,6 +740,10 @@ fn run<B: ratatui::backend::Backend>(
                     // modo selección de encoder
                     match k.code {
                         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
+                        KeyCode::Char('U') => {
+                            app.refresh_users();
+                            app.user_screen = true;
+                        }
                         KeyCode::Char('w') => {
                             app.status = "conectando (v1 WiFi)…".into();
                             app.rx = Some(openspd_io::spawn_tcp_reader(ENCODER_HOST.to_string(), ENCODER_PORT));
@@ -615,10 +819,63 @@ fn ui_select(f: &mut Frame, app: &App) {
         Span::raw(" escanear BLE  "),
         Span::styled(" 1-9 ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" conectar  "),
+        Span::styled(" U ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" usuarios  "),
         Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" salir"),
     ]);
     f.render_widget(Paragraph::new(help).block(Block::default().borders(Borders::ALL).title(" Atajos ")), root[2]);
+}
+
+/// Pantalla de gestión de usuarios: lista (con el activo marcado), navegación y alta de usuarios.
+fn ui_users(f: &mut Frame, app: &App) {
+    let root = Layout::vertical([Constraint::Length(3), Constraint::Min(4), Constraint::Length(3), Constraint::Length(3)])
+        .split(f.area());
+
+    let title = Line::from(vec![
+        Span::styled(" OpenSPD ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw("  Usuarios  ·  cada usuario guarda sus series y su perfil por separado"),
+    ]);
+    f.render_widget(Paragraph::new(title).block(Block::default().borders(Borders::ALL)), root[0]);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, u) in app.users.iter().enumerate() {
+        let active = u.slug == app.active_user;
+        let mark = if i == app.user_sel { "▶" } else { " " };
+        let dot = if active { "●" } else { " " };
+        let style = if i == app.user_sel {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else if active {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(format!("{mark} {dot} {}", u.display), style));
+    }
+    if lines.is_empty() {
+        lines.push(Line::styled("(sin usuarios)", Style::default().fg(Color::DarkGray)));
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Usuarios ")),
+        root[1],
+    );
+
+    let input = Line::from(vec![
+        Span::raw("Nuevo usuario: "),
+        Span::styled(&app.user_input, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("▏", Style::default().fg(Color::Yellow)),
+    ]);
+    f.render_widget(Paragraph::new(input).block(Block::default().borders(Borders::ALL).title(" Añadir ")), root[2]);
+
+    let help = Line::from(vec![
+        Span::styled(" ↑↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" mover  "),
+        Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" seleccionar (o añadir si escribes un nombre)  "),
+        Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" volver"),
+    ]);
+    f.render_widget(Paragraph::new(help).block(Block::default().borders(Borders::ALL).title(" Atajos ")), root[3]);
 }
 
 fn ui(f: &mut Frame, app: &App) {
@@ -670,6 +927,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     }
     let line = Line::from(vec![
         Span::styled(" OpenSPD ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw("  Usuario: "),
+        Span::styled(app.active_display(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw("  Ejercicio: "),
         Span::styled(&app.exercise, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::raw("   Carga: "),
@@ -920,6 +1179,8 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" guardar  "),
         Span::styled(" b ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" cambiar encoder  "),
+        Span::styled(" U ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" usuarios  "),
         Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" salir"),
     ]);
@@ -980,6 +1241,12 @@ mod tests {
             scanning: false,
             scan_rx: None,
             scan_results: Vec::new(),
+            active_user: "default".into(),
+            users: Vec::new(),
+            user_input: String::new(),
+            user_screen: false,
+            user_sel: 0,
+            sessions: HashMap::new(),
         }
     }
 
