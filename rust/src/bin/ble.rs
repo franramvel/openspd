@@ -74,7 +74,7 @@ fn main() {
     eprintln!(
         "OpenSPD {} · GPL-3.0-or-later, sin garantía. Software NO oficial; cliente de interoperabilidad.\n\
          Estimaciones (%1RM, velocity loss) orientativas: NO sustituyen a un profesional; \
-         entrenas bajo tu propia responsabilidad.",
+         el uso es bajo responsabilidad del usuario.",
         env!("CARGO_PKG_VERSION")
     );
     let args = parse_args();

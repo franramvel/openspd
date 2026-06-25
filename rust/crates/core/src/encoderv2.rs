@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 OpenSPD contributors
-//! Protocolo del encoder VBT "v2" (BLE) — documentado **observando el tráfico BLE de tu propio
-//! dispositivo** (captura HCI), no a partir de software de terceros.
+//! Protocolo del encoder VBT "v2" (BLE) — documentado **observando el tráfico BLE de un dispositivo
+//! propio** (captura HCI), no a partir de software de terceros.
 //!
 //! Lo observable en la captura:
 //! - Nada más conectar, el central ESCRIBE una "llave" (texto) en la característica de desbloqueo;

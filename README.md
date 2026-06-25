@@ -15,18 +15,19 @@ en Arch); si no hay dispositivo de audio en ejecución, el GUI funciona en silen
 
 **Dispositivos probados:** un encoder VBT de **1ª generación, solo WiFi** (el v1) y un encoder **BLE**
 (el v2), ambos en posesión del autor del proyecto. ⚠️ Los modelos comerciales **actuales** (p. ej. el
-"Force") son hardware distinto y casi seguro **otro protocolo**: no des por hecha la compatibilidad
-con un equipo nuevo.
+"Force") son hardware distinto y casi seguro **otro protocolo**: no debe darse por hecha la
+compatibilidad con un equipo nuevo.
 
-> ⚠️ **Seguridad / entrenamiento:** OpenSPD estima %1RM y avisa de fatiga (velocity loss) sobre los
-> que vas a cargar peso real. Las estimaciones son **orientativas**, **no** sustituyen la supervisión
-> de un profesional, y entrenas **bajo tu propia responsabilidad**. Sin garantía (ver `DISCLAIMER.md`).
+> ⚠️ **Seguridad / entrenamiento:** OpenSPD estima %1RM y avisa de fatiga (velocity loss) sobre
+> cargas de peso reales. Las estimaciones son **orientativas**, **no** sustituyen la supervisión
+> de un profesional, y el entrenamiento corre **bajo responsabilidad propia del usuario**. Sin
+> garantía (ver `DISCLAIMER.md`).
 
 ## 1. Red: conectarse al encoder SIN perder internet (Linux + NetworkManager)
 
 Ejemplo con un PC que tiene internet por cable (`enp5s0`) y WiFi (`wlan0`): se conecta el WiFi al
 encoder pero se le impide tomar la ruta por defecto, así internet sigue saliendo por el cable
-(ajusta los nombres de interfaz a los de tu equipo):
+(los nombres de interfaz se ajustan a los del equipo):
 
 ```bash
 nmcli dev wifi connect "Speed4lifts_167" password "123456789" ifname wlan0
@@ -36,8 +37,8 @@ nmcli con modify "Speed4lifts_167" \
 nmcli con up "Speed4lifts_167"
 ```
 
-> `Speed4lifts_167` es el **SSID de fábrica** que emite tu encoder (no es nombre de OpenSPD):
-> hay que usarlo literal para que `nmcli` se conecte. Sustituye por el que muestre tu dispositivo.
+> `Speed4lifts_167` es el **SSID de fábrica** que emite el encoder (no es nombre de OpenSPD):
+> hay que usarlo literal para que `nmcli` se conecte. Se sustituye por el que muestre el dispositivo.
 
 Comprobar: `ip route` debe seguir mostrando la `default` por el cable; el encoder queda en
 `192.168.4.1` y el PC recibe `192.168.4.x`.
@@ -52,12 +53,37 @@ Comprobar: `ip route` debe seguir mostrando la `default` por el cable; el encode
 >
 > El **encoder v2 (BLE) es un caso distinto**: su stream sí va cifrado y, para interoperar, hay que
 > descifrarlo (ver §4). Eso se hace **conscientemente al amparo de la excepción de ingeniería
-> inversa para interoperabilidad** —sobre un dispositivo de tu propiedad, con software independiente
+> inversa para interoperabilidad** —sobre un dispositivo en propiedad, con software independiente
 > y sin redistribuir nada del fabricante— según se detalla en §5. No lo escondemos: lo enmarcamos.
 
 - Solo el **puerto 80/TCP** está abierto.
-- No responde a HTTP/WebSocket. Nada más conectarte por TCP, **empuja** una línea ASCII
-  por **cada repetición**, terminada en `\r\n`:
+- No responde a HTTP/WebSocket. Es un stream TCP propietario.
+
+### El v1 NO es solo lectura: hay un comando de arranque
+
+Nada más conectar, el cliente **debe enviar un comando**; **hasta recibirlo el encoder no emite
+ninguna repetición** (esto explica el "no manda datos por WiFi" ante una conexión que solo escucha
+en pasivo). El comando además **selecciona el ejercicio** que muestra el encoder en su pantalla.
+Handshake:
+
+1. El cliente envía `?<E>6<X><ROM>` + `\n` (LF) y lo **reintenta cada 1 s hasta 5 veces** hasta el eco.
+2. El encoder responde una línea con `!` cuyo sufijo es el mismo payload (eco) → confirmado.
+3. A partir de ahí el encoder **empuja** una línea ASCII por cada repetición, terminada en `\r\n`.
+
+Donde el payload `<E>6<X><ROM>` es:
+
+| Parte | Significado |
+|-------|-------------|
+| `X` (ejercicio) | `1` banca · `2` sentadilla · `3` peso muerto · `4` press militar · `5` dominadas · `9` test |
+| `E` | `2` concéntrica (normal) · `1` si se mide la fase excéntrica |
+| `6` | modo tiempo real (constante) |
+| `ROM` | umbral mínimo de recorrido (cm) para contar una rep (p. ej. `15`) |
+
+Ejemplo: **press banca**, ROM 15 → se envía `?26115\n`; el encoder cambia su modo a "press banca"
+y empieza a emitir. OpenSPD construye este comando desde `--exercise` (mapea banca/sentadilla/…),
+`--rom CM` (def. 10) y `--excentrica`. *(Validado en vivo: 17 reps tras `?26115`.)*
+
+Formato de cada repetición:
 
 ```
 @<rep>*<vel_media>#<rom>$<vel_maxima>&
@@ -98,9 +124,11 @@ cargo build --release         # binarios en target/release/ (openspd, openspd-tu
 cargo run --release --bin openspd -- --exercise sentadilla --load 80 --vl-stop 20
 ```
 
-Opciones: `--exercise banca|sentadilla` y `--load KG` (estima %1RM/1RM),
-`--vl-stop PCT` (aviso de fatiga), `--rest SEG` (hueco para considerar nueva serie, def. 30),
-`--csv ARCHIVO`. Cierra con **Ctrl‑C**; el CSV se guarda tras cada rep (nunca se pierde).
+Opciones: `--exercise banca|sentadilla|peso muerto|press militar|dominadas|test` (selecciona el
+modo en el encoder v1 **y** estima %1RM/1RM), `--load KG`, `--rom CM` (umbral para contar rep, def. 10),
+`--excentrica` (medir fase excéntrica), `--vl-stop PCT` (aviso de fatiga),
+`--rest SEG` (hueco para considerar nueva serie, def. 30), `--csv ARCHIVO`.
+La sesión se cierra con **Ctrl‑C**; el CSV se guarda tras cada rep (nunca se pierde).
 
 > Los `.py` de la raíz son la **referencia** del descubrimiento del protocolo (ya cumplieron).
 
@@ -114,8 +142,8 @@ Panel en vivo: serie actual, velocity loss (gauge), y el **perfil carga-velocida
 ajusta solo. Atajos: `+/-` carga ±2.5 · `[ ]` ±10 · `c` cerrar serie · `u` deshacer punto ·
 `s` guardar · `q` salir.
 
-**Construir tu perfil:** pon una carga (`+/-`), haz la serie, descansa (o `c`) → se añade el
-punto (carga, mejor velocidad). Repite con 2-3 cargas distintas → 1RM y R² en vivo. `s` guarda
+**Construir el perfil:** se fija una carga (`+/-`), se hace la serie y se descansa (o `c`) → se
+añade el punto (carga, mejor velocidad). Con 2-3 cargas distintas → 1RM y R² en vivo. `s` guarda
 `<ejercicio>.lvp`.
 
 ### GUI nativa (egui/eframe)
@@ -128,7 +156,7 @@ cargo run --release --bin openspd-gui -- --profile sentadilla.lvp   # seguir un 
 Ventana con: serie actual (tabla + gráfica de barras de velocidad + barra de velocity loss) y
 panel de **perfil carga-velocidad** con scatter de puntos, recta de regresión y 1RM/R² en vivo.
 Controles: combo de ejercicio, ± de carga, "Cerrar serie", "Deshacer punto", "Guardar".
-Construye el perfil igual que el TUI (varias cargas → puntos → ajuste). Probada en NVIDIA+Wayland
+El perfil se construye igual que en el TUI (varias cargas → puntos → ajuste). Probada en NVIDIA+Wayland
 (backend OpenGL/glow).
 
 > ¿Por qué egui y no Tauri/WASM? El encoder habla **TCP crudo**; el sandbox del navegador (WASM)
@@ -138,8 +166,8 @@ Construye el perfil igual que el TUI (varias cargas → puntos → ajuste). Prob
 ### Perfil carga-velocidad (`profile.rs`)
 
 `v = a + b·carga` por mínimos cuadrados; con el umbral V1RM (0.30 squat, 0.17 banca, 0.50 peso
-muerto) calcula tu **1RM real** y el **%1RM** de cualquier velocidad. Individual = mucho más
-preciso que las ecuaciones poblacionales. Reúsalo en el CLI con `openspd --profile sentadilla.lvp`.
+muerto) calcula el **1RM real** y el **%1RM** de cualquier velocidad. Individual = mucho más
+preciso que las ecuaciones poblacionales. Se reutiliza en el CLI con `openspd --profile sentadilla.lvp`.
 
 ## 4. Encoder v2 (BLE, datos cifrados) — `openspd-ble`
 
@@ -154,15 +182,15 @@ cargo run --release --bin openspd-ble -- --address AA:BB:CC:DD:EE:FF
 ```
 
 - **Selector**: escanea y lista los encoders disponibles (los v2 se detectan por su UUID de
-  servicio); eliges uno por número. `--address` conecta directo.
+  servicio); se elige uno por número. `--address` conecta directo.
 - Cada repetición trae: nº, **fase concéntrica/excéntrica**, velocidad media propulsiva, ROM,
   velocidad pico, velocidad media y aceleraciones. Se reutilizan las mismas métricas (velocity
   loss, zonas) y se guarda CSV.
 - Transporte vía **BlueZ (`bluer`)**. Módulo `encoderv2.rs` (llave + AES + parser) con tests que
   validan el descifrado sobre datos reales. Requiere `libdbus`/BlueZ (Linux).
 
-> Nota: si el encoder v2 está conectado a otro central (p. ej. tu móvil), libéralo primero (apaga
-> el Bluetooth del teléfono); BLE solo admite un central a la vez.
+> Nota: si el encoder v2 está conectado a otro central (p. ej. el móvil), conviene liberarlo primero
+> (apagando el Bluetooth del teléfono); BLE solo admite un central a la vez.
 
 ## 5. Licencia y aviso legal
 

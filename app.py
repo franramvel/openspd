@@ -14,7 +14,7 @@ Uso:
     python3 app.py --vl-stop 20         # avisa cuando el velocity loss supere 20%
     python3 app.py --csv mi_serie.csv   # nombre de archivo concreto
 
-Antes de correr, conecta tu WiFi al AP 'Speed4lifts_167' (ver README).
+Antes de correr, conectar el WiFi al AP 'Speed4lifts_167' (ver README).
 """
 from __future__ import annotations
 import argparse

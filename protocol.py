@@ -6,8 +6,8 @@ Protocolo del encoder VBT (1a gen, WiFi).
 
 Descubierto por ingenieria inversa y CONFIRMADO contra la pantalla del encoder:
 
-    El encoder es su propio AP WiFi. Te conectas por TCP a 192.168.4.1:80 y, sin pedir
-    nada, EMITE una linea ASCII por CADA REPETICION completa, terminada en "\r\n":
+    El encoder es su propio AP WiFi. El cliente se conecta por TCP a 192.168.4.1:80 y este
+    EMITE una linea ASCII por CADA REPETICION completa, terminada en "\r\n":
 
         @<rep>*<vel_media>#<rom>$<vel_maxima>&
 
