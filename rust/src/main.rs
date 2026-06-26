@@ -11,10 +11,15 @@
 //! Uso:
 //!   openspd                                   graba una sesion (Ctrl-C para terminar)
 //!   openspd --exercise banca --load 80        estima %1RM y 1RM con esa carga
+//!   openspd --excentrica                      mide la fase excentrica (por defecto: concentrica)
 //!   openspd --vl-stop 20                      avisa al superar 20% de velocity loss en la serie
 //!   openspd --rest 25                         considera nueva serie tras 25s sin reps (def. 30)
 //!   openspd --csv sesion.csv                  archivo de salida
 //!
+//! El encoder v1 mide la fase CONCENTRICA limpia (modo no-tiempo-real, const 7; ver protocol.rs).
+//! --exercise fija el ejercicio en la pantalla del encoder Y la estimacion de %1RM; si no se da (o no
+//! mapea a un modo nativo del v1) se usa banca como modo del encoder. --excentrica mide la excentrica.
+//! Ejercicios con modo nativo en el v1: banca, sentadilla, peso muerto, press militar, dominadas.
 //! Ejercicios con ecuacion de %1RM: banca/bench/press, sentadilla/squat.
 
 use std::sync::mpsc::RecvTimeoutError;
@@ -200,21 +205,24 @@ fn main() {
     );
     println!("{}", "-".repeat(74));
 
-    // Comando de arranque del v1: selecciona el ejercicio en el encoder (sin él NO emite reps).
-    // Mapea --exercise a un modo nativo del v1; si no encaja (o no se dio), usa el modo Test (9).
+    // Comando de arranque del v1 (sin él NO cuenta reps). El modo del encoder = el ejercicio elegido
+    // (--exercise); si no se da o no mapea a un modo nativo del v1 (X=1..5), se usa banca. Se evita
+    // ALL/test (X=9) a propósito: reporta ambas fases. La FASE la fija el byte E (concéntrica por
+    // defecto; --excentrica para la excéntrica). El modo no-tiempo-real (const 7) da concéntrica limpia.
     let v1_mode = args
         .exercise
         .as_deref()
         .and_then(ExerciseV1::from_name)
-        .unwrap_or(ExerciseV1::Test);
+        .unwrap_or(ExerciseV1::Bench);
     let rom = args.rom.unwrap_or(DEFAULT_ROM_CM);
     let command = start_command(v1_mode, rom, args.eccentric);
-    println!("Modo encoder v1: {v1_mode:?} · ROM≥{rom} cm{} (cmd ?{command})",
-        if args.eccentric { " · excéntrica" } else { "" });
+    println!("Modo encoder v1: {} · Fase: {} · ROM≥{rom} cm (cmd ?{command})",
+        v1_mode.label(),
+        if args.eccentric { "excéntrica" } else { "concéntrica" });
 
     // El transporte vive en openspd-io; aquí solo consumimos el canal. Usamos recv_timeout para
     // poder detectar el fin de serie por descanso aunque no lleguen reps.
-    let rx = openspd_io::spawn_tcp_reader(args.host.clone(), args.port, Some(command));
+    let rx = openspd_io::spawn_tcp_reader(args.host.clone(), args.port, command);
 
     let mut log: Vec<LoggedRep> = Vec::new();
     let mut current_set: Vec<Rep> = Vec::new();

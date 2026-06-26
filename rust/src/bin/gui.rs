@@ -76,6 +76,8 @@ struct GuiApp {
     scanning: bool,
     scan_rx: Option<Receiver<Result<Vec<(String, String)>, String>>>,
     scan_results: Vec<(String, String)>,
+    // fase del encoder v1: false = concéntrica (por defecto), true = excéntrica
+    eccentric: bool,
     // audio: beeps de cuenta atrás y alarma al perder la velocidad objetivo
     _audio_stream: Option<rodio::OutputStream>, // mantener vivo o el sonido se corta
     audio: Option<rodio::OutputStreamHandle>,
@@ -555,15 +557,24 @@ impl GuiApp {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.label(egui::RichText::new("Encoder v1 — WiFi").strong());
                 ui.label("Requiere estar conectado al AP del encoder (ver README).");
+                let mode = ExerciseV1::from_name(&self.exercise).unwrap_or(ExerciseV1::Bench);
+                ui.horizontal(|ui| {
+                    ui.label("Captura:");
+                    ui.label(egui::RichText::new(mode.label()).color(egui::Color32::LIGHT_BLUE));
+                    ui.separator();
+                    ui.label("Fase:");
+                    ui.selectable_value(&mut self.eccentric, false, "concéntrica");
+                    ui.selectable_value(&mut self.eccentric, true, "excéntrica");
+                });
                 if ui.button(format!("▶ Conectar (TCP {ENCODER_HOST}:{ENCODER_PORT})")).clicked() {
                     self.status = "conectando (v1)…".into();
-                    // El v1 necesita el comando de arranque con el ejercicio para emitir reps.
-                    let mode = ExerciseV1::from_name(&self.exercise).unwrap_or(ExerciseV1::Test);
-                    let command = start_command(mode, DEFAULT_ROM_CM, false);
+                    // Modo del encoder = ejercicio elegido (fallback banca); fase = self.eccentric.
+                    // Modo no-tiempo-real (const 7) → concéntrica limpia vía sondeo de ?8.
+                    let command = start_command(mode, DEFAULT_ROM_CM, self.eccentric);
                     self.rx = Some(openspd_io::spawn_tcp_reader(
                         ENCODER_HOST.to_string(),
                         ENCODER_PORT,
-                        Some(command),
+                        command,
                     ));
                 }
             });
@@ -975,6 +986,7 @@ fn main() -> eframe::Result<()> {
         scanning: false,
         scan_rx: None,
         scan_results: Vec::new(),
+        eccentric: false,
         _audio_stream: audio_stream,
         audio: audio_handle,
         vl_target: 20.0,

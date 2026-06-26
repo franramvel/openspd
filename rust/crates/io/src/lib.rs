@@ -55,13 +55,25 @@ pub enum BleEvent {
 
 // ─────────────────────────────── TCP (encoder v1) ───────────────────────────────
 
-/// Conecta por TCP al encoder v1 en un hilo y emite cada repetición parseada por el canal.
+/// Intervalo de sondeo de `?8` (recuperar reps). El encoder en modo no-tiempo-real no transmite las
+/// reps solo: hay que pedírselas. Cada poll devuelve la lista acumulada; deduplicamos por nº de rep.
+const POLL_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Conecta por TCP al encoder v1 en un hilo y emite cada repetición (concéntrica) parseada por el canal.
 ///
 /// `command` es el *payload* de arranque del encoder v1 ([`openspd_core::protocol::start_command`],
-/// sin el prefijo `?`): selecciona el ejercicio en su pantalla. El encoder **no emite reps hasta
-/// recibirlo**, así que se envía como `?<payload>\n` y se reintenta cada segundo (hasta 5 veces)
-/// hasta que el encoder devuelve el eco `!<payload>`. Con `None` se lee en pasivo (compatibilidad).
-pub fn spawn_tcp_reader(host: String, port: u16, command: Option<String>) -> Receiver<RepEvent> {
+/// sin el prefijo `?`): fija el ejercicio, la fase y el modo **no-tiempo-real** (const `7`) en el
+/// encoder. El encoder **no cuenta reps hasta recibirlo**, así que se envía como `?<payload>\n` y se
+/// reintenta cada segundo (hasta 5 veces) hasta ver el eco `!<payload>`.
+///
+/// En modo no-tiempo-real el encoder ALMACENA una concéntrica limpia por rep pero NO la transmite: el
+/// hilo escritor, una vez confirmado el modo, **sondea [`RECOVER_PAYLOAD`] (`?8\n`) cada
+/// [`POLL_INTERVAL`]**; el encoder responde con la lista acumulada (líneas `@…&`) y el lector
+/// **deduplica por número de rep** (emite solo las nuevas). Esto resuelve el "bug de la excéntrica":
+/// en tiempo real (const `6`) el encoder colaba la fase excéntrica. Ver doc de
+/// [`openspd_core::protocol`].
+pub fn spawn_tcp_reader(host: String, port: u16, command: String) -> Receiver<RepEvent> {
+    use openspd_core::protocol::RECOVER_PAYLOAD;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         use std::io::{BufRead, BufReader, Write};
@@ -78,52 +90,62 @@ pub fn spawn_tcp_reader(host: String, port: u16, command: Option<String>) -> Rec
             }
         };
 
-        // Handshake del v1: reenvía "?<payload>\n" cada segundo hasta ver el eco "!<payload>".
-        // `confirmed` arranca en true si no hay comando (lectura pasiva): nada que confirmar.
-        let confirmed = Arc::new(AtomicBool::new(command.is_none()));
-        if let Some(payload) = command.clone() {
-            match stream.try_clone() {
-                Ok(mut writer) => {
-                    let confirmed = confirmed.clone();
-                    let line = format!("?{payload}\n");
-                    let _ = tx.send(RepEvent::Status(format!("enviando modo ({line:?})…")));
-                    thread::spawn(move || {
-                        for _ in 0..5 {
-                            if confirmed.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            if writer.write_all(line.as_bytes()).is_err() {
-                                break;
-                            }
-                            let _ = writer.flush();
-                            thread::sleep(Duration::from_secs(1));
+        // Hilo escritor: (1) handshake — reenvía "?<payload>\n" cada segundo hasta ver el eco; luego
+        // (2) sondea "?8\n" cada POLL_INTERVAL para recuperar las reps almacenadas.
+        let confirmed = Arc::new(AtomicBool::new(false));
+        match stream.try_clone() {
+            Ok(mut writer) => {
+                let confirmed = confirmed.clone();
+                let start = format!("?{command}\n");
+                let poll = format!("?{RECOVER_PAYLOAD}\n");
+                let _ = tx.send(RepEvent::Status(format!("enviando modo ({start:?})…")));
+                thread::spawn(move || {
+                    // Handshake: hasta 5 intentos (1 s) o hasta que el lector confirme el eco.
+                    for _ in 0..5 {
+                        if confirmed.load(Ordering::Relaxed) {
+                            break;
                         }
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(RepEvent::Status(format!("aviso: no se pudo enviar el modo: {e}")));
-                }
+                        if writer.write_all(start.as_bytes()).is_err() || writer.flush().is_err() {
+                            return;
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                    // Sondeo de reps (no-tiempo-real): pedir la lista acumulada periódicamente.
+                    loop {
+                        if writer.write_all(poll.as_bytes()).is_err() || writer.flush().is_err() {
+                            break;
+                        }
+                        thread::sleep(POLL_INTERVAL);
+                    }
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(RepEvent::Status(format!("aviso: no se pudo enviar el modo: {e}")));
             }
         }
 
         let _ = tx.send(RepEvent::Status("conectado · esperando reps".into()));
+        // Deduplicación: cada ?8 devuelve @1..@N acumulado; emitimos solo las reps con nº > max_seen.
+        let mut max_seen: u32 = 0;
         let reader = BufReader::new(stream);
         for line in reader.lines() {
             match line {
                 Ok(l) => {
-                    // Eco del comando: una línea "…!<payload>" confirma el modo (corta los reintentos).
-                    if let Some(payload) = command.as_deref() {
-                        if let Some(idx) = l.find('!') {
-                            if l[idx + 1..].trim() == payload {
-                                // Solo anunciamos la confirmación la primera vez (el encoder repite el eco).
-                                if !confirmed.swap(true, Ordering::Relaxed) {
-                                    let _ = tx.send(RepEvent::Status("modo confirmado · midiendo".into()));
-                                }
-                                continue;
+                    // Eco del comando ("…!<payload>") confirma el modo y corta los reintentos. El eco
+                    // de "?8" ("!8") no casa con `command` y lo ignora el parser de reps.
+                    if let Some(idx) = l.find('!') {
+                        if l[idx + 1..].trim() == command {
+                            if !confirmed.swap(true, Ordering::Relaxed) {
+                                let _ = tx.send(RepEvent::Status("modo confirmado · midiendo".into()));
                             }
+                            continue;
                         }
                     }
                     if let Some(rep) = parse_line(&l) {
+                        if rep.rep <= max_seen {
+                            continue; // ya emitida en un sondeo anterior
+                        }
+                        max_seen = rep.rep;
                         if tx.send(RepEvent::Rep(rep)).is_err() {
                             return;
                         }

@@ -54,7 +54,7 @@ Comprobar: `ip route` debe seguir mostrando la `default` por el cable; el encode
 > El **encoder v2 (BLE) es un caso distinto**: su stream sí va cifrado y, para interoperar, hay que
 > descifrarlo (ver §4). Eso se hace **conscientemente al amparo de la excepción de ingeniería
 > inversa para interoperabilidad** —sobre un dispositivo en propiedad, con software independiente
-> y sin redistribuir nada del fabricante— según se detalla en §5. No lo escondemos: lo enmarcamos.
+> y sin redistribuir nada del fabricante— según se detalla en §5. No se oculta: se enmarca.
 
 - Solo el **puerto 80/TCP** está abierto.
 - No responde a HTTP/WebSocket. Es un stream TCP propietario.
@@ -66,22 +66,31 @@ ninguna repetición** (esto explica el "no manda datos por WiFi" ante una conexi
 en pasivo). El comando además **selecciona el ejercicio** que muestra el encoder en su pantalla.
 Handshake:
 
-1. El cliente envía `?<E>6<X><ROM>` + `\n` (LF) y lo **reintenta cada 1 s hasta 5 veces** hasta el eco.
+1. El cliente envía `?<E>7<X><ROM>` + `\n` (LF) y lo **reintenta cada 1 s hasta 5 veces** hasta el eco.
 2. El encoder responde una línea con `!` cuyo sufijo es el mismo payload (eco) → confirmado.
-3. A partir de ahí el encoder **empuja** una línea ASCII por cada repetición, terminada en `\r\n`.
+3. A partir de ahí el cliente **sondea** `?8\n` cada ~1,5 s; el encoder responde con la **lista
+   acumulada** de repeticiones (una línea ASCII por rep). El cliente deduplica por número de rep.
 
-Donde el payload `<E>6<X><ROM>` es:
+Donde el payload `<E>7<X><ROM>` es:
 
 | Parte | Significado |
 |-------|-------------|
-| `X` (ejercicio) | `1` banca · `2` sentadilla · `3` peso muerto · `4` press militar · `5` dominadas · `9` test |
-| `E` | `2` concéntrica (normal) · `1` si se mide la fase excéntrica |
-| `6` | modo tiempo real (constante) |
+| `X` (modo) | `1` banca · `2` sentadilla · `3` peso muerto · `4` press militar · `5` dominadas · `9` ALL (test) |
+| `E` | `2` concéntrica (normal) · `1` fase excéntrica |
+| `7` | modo **no-tiempo-real**: el encoder guarda una concéntrica limpia por rep y se recupera con `?8` |
 | `ROM` | umbral mínimo de recorrido (cm) para contar una rep (p. ej. `15`) |
 
-Ejemplo: **press banca**, ROM 15 → se envía `?26115\n`; el encoder cambia su modo a "press banca"
-y empieza a emitir. OpenSPD construye este comando desde `--exercise` (mapea banca/sentadilla/…),
-`--rom CM` (def. 10) y `--excentrica`. *(Validado en vivo: 17 reps tras `?26115`.)*
+La clave para medir la **concéntrica limpia** es la constante `7` (no-tiempo-real): el encoder calcula
+una sola velocidad por repetición y la almacena, y el cliente la recupera sondeando `?8`. Con la
+constante `6` (tiempo real) el encoder hace *streaming* de cada fase según la detecta y **se cuela la
+excéntrica** —ese era el "bug de la excéntrica"—. El modo `X=9` ("ALL"/test) **reporta ambas fases**
+siempre, así que no sirve para concéntrico; OpenSPD usa un **ejercicio concreto** (`X=1..5`).
+
+Por defecto OpenSPD arranca el v1 en el **ejercicio de `--exercise`** (o banca si no se indica o no
+mapea), fase **concéntrica**, no-tiempo-real → p. ej. banca envía `?27110\n`. El mismo `--exercise`
+fija el modo en la pantalla del encoder y la estimación de %1RM; `--excentrica` mide la fase excéntrica.
+*(Validado en vivo 2026-06-26: series normales → todas concéntricas limpias. Un drop excéntrico rápido
+de rango completo sin concéntrica sí se cuenta —limitación inherente del encoder—.)*
 
 Formato de cada repetición:
 
@@ -124,10 +133,11 @@ cargo build --release         # binarios en target/release/ (openspd, openspd-tu
 cargo run --release --bin openspd -- --exercise sentadilla --load 80 --vl-stop 20
 ```
 
-Opciones: `--exercise banca|sentadilla|peso muerto|press militar|dominadas|test` (selecciona el
-modo en el encoder v1 **y** estima %1RM/1RM), `--load KG`, `--rom CM` (umbral para contar rep, def. 10),
-`--excentrica` (medir fase excéntrica), `--vl-stop PCT` (aviso de fatiga),
-`--rest SEG` (hueco para considerar nueva serie, def. 30), `--csv ARCHIVO`.
+Opciones: `--exercise banca|sentadilla|peso muerto|press militar|dominadas` (fija el modo del encoder
+**y** estima %1RM/1RM; def. banca si no mapea), `--excentrica` (fase excéntrica; def. concéntrica),
+`--load KG`, `--rom CM` (umbral para contar rep,
+def. 10), `--vl-stop PCT` (aviso de fatiga), `--rest SEG` (hueco para considerar nueva serie, def. 30),
+`--csv ARCHIVO`.
 La sesión se cierra con **Ctrl‑C**; el CSV se guarda tras cada rep (nunca se pierde).
 
 > Los `.py` de la raíz son la **referencia** del descubrimiento del protocolo (ya cumplieron).
