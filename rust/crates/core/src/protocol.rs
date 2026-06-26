@@ -3,17 +3,24 @@
 //! Protocolo del encoder VBT (1a gen, WiFi).
 //!
 //! El encoder es su propio AP WiFi. El cliente se conecta por TCP a 192.168.4.1:80 y debe enviarle
-//! un comando de arranque `?<E>6<X><ROM>\n` (ver [`start_command`]); el encoder NO emite ninguna
+//! un comando de arranque `?<E>7<X><ROM>\n` (ver [`start_command`]); el encoder NO cuenta ninguna
 //! repeticion hasta recibirlo, y lo confirma devolviendo el mismo payload tras un '!' (eco). El
-//! comando ademas selecciona el ejercicio en la pantalla del encoder. Tras el eco, el encoder emite
-//! una linea ASCII por CADA REPETICION, terminada en "\r\n":
+//! comando ademas selecciona el ejercicio en la pantalla del encoder.
+//!
+//! **Modo no-tiempo-real (const `7`) y recuperacion por sondeo** (validado en vivo 2026-06-26): con
+//! la constante `7` el encoder calcula UNA velocidad concentrica limpia por repeticion y la ALMACENA;
+//! NO la transmite sola. Para leerla, el cliente envia [`RECOVER_PAYLOAD`] (`?8\n`) y el encoder
+//! responde con la lista ACUMULADA de repeticiones (una linea por rep). Sondeando `?8` cada pocos
+//! segundos y deduplicando por numero de rep se obtienen en vivo. (La constante `6` —tiempo real—
+//! hace streaming de CADA fase segun la detecta, colando la excentrica: ese era el "bug de la
+//! excentrica". Por eso se usa `7`, no `6`.) Cada linea de repeticion, terminada en "\r\n":
 //!
 //! ```text
 //! @<rep>*<vel_media>#<rom>$<vel_maxima>&     ej: @4*1.55#55.77$2.06&
 //! ```
 //!
 //! Confirmado contra la pantalla del encoder:
-//!   rep        = numero de repeticion
+//!   rep        = numero de repeticion (acumulado dentro de la sesion)
 //!   vel_media  = velocidad media   (m/s)
 //!   rom        = recorrido / ROM   (cm)
 //!   vel_maxima = velocidad pico    (m/s)  (siempre > media)
@@ -24,6 +31,11 @@ pub const ENCODER_PORT: u16 = 80;
 /// ROM mínimo (cm) por defecto: umbral de recorrido para que el encoder v1 cuente una repetición.
 /// Bajo a propósito para que cualquier rep válida cuente; súbelo para filtrar reps parciales.
 pub const DEFAULT_ROM_CM: u32 = 10;
+
+/// Payload (sin el `?`) para recuperar la lista de repeticiones almacenadas en modo no-tiempo-real.
+/// Se envía como `?8\n` y el encoder responde con todas las reps acumuladas (líneas `@…&`). La capa
+/// de I/O lo sondea periódicamente y deduplica por número de rep. Ver doc del módulo.
+pub const RECOVER_PAYLOAD: &str = "8";
 
 /// Modo de ejercicio que el encoder v1 fija en su pantalla (cada uno es un código de 1 carácter).
 ///
@@ -36,7 +48,12 @@ pub enum ExerciseV1 {
     Deadlift,      // peso muerto   -> '3'
     MilitaryPress, // press militar -> '4'
     PullUp,        // dominadas     -> '5'
-    Test,          // modo test/genérico -> '9'
+    /// Modo **ALL/test** del v1 (X=9): cuenta cualquier movimiento sin perfil de ejercicio.
+    /// **Reporta SIEMPRE ambas fases** (concéntrica Y excéntrica), validado en vivo 2026-06-26 — el
+    /// byte `E` no lo filtra. Por eso NO sirve para VBT concéntrico y NO es el modo por defecto: para
+    /// concéntrica limpia se usa un ejercicio concreto (X=1..5) con const `7`. Queda como modo crudo
+    /// "cuéntalo todo".
+    Test, // modo ALL/test -> '9'
 }
 
 impl ExerciseV1 {
@@ -63,26 +80,41 @@ impl ExerciseV1 {
                 Some(Self::MilitaryPress)
             }
             "dominada" | "dominadas" | "pull-up" | "pullup" | "pull up" => Some(Self::PullUp),
-            "test" => Some(Self::Test),
+            "all" | "todo" | "global" | "test" => Some(Self::Test),
             _ => None,
+        }
+    }
+
+    /// Etiqueta legible para mostrar el modo en CLI/TUI/GUI.
+    pub fn label(self) -> &'static str {
+        match self {
+            ExerciseV1::Bench => "press banca",
+            ExerciseV1::Squat => "sentadilla",
+            ExerciseV1::Deadlift => "peso muerto",
+            ExerciseV1::MilitaryPress => "press militar",
+            ExerciseV1::PullUp => "dominadas",
+            ExerciseV1::Test => "ALL (test)",
         }
     }
 }
 
 /// Construye el *payload* del comando de arranque del encoder v1 (SIN el prefijo `?`).
 ///
-/// Formato observado en la app oficial: `<E>6<X><ROM>` donde
-///   - `E`   = `'2'` concéntrica (normal) | `'1'` si además se mide la fase excéntrica,
-///   - `'6'` = modo tiempo real (constante),
-///   - `X`   = código de ejercicio ([`ExerciseV1::code`]),
+/// Formato: `<E>7<X><ROM>` donde
+///   - `E`   = `'2'` concéntrica (normal) | `'1'` si en cambio se mide la fase excéntrica,
+///   - `'7'` = modo **no-tiempo-real**: el encoder calcula una concéntrica limpia por rep y la
+///     almacena para recuperarla con [`RECOVER_PAYLOAD`] (`?8`). (Con `'6'` —tiempo real— colaba la
+///     excéntrica: era el "bug de la excéntrica". Validado en vivo 2026-06-26.)
+///   - `X`   = código de ejercicio ([`ExerciseV1::code`]); usar un ejercicio concreto (1..5), NO el
+///     modo ALL/test (9), que reporta ambas fases.
 ///   - `ROM` = umbral mínimo de recorrido (cm) para contar una repetición.
 ///
-/// El encoder devuelve este mismo payload como eco tras un `!` al confirmarlo, y **no emite
+/// El encoder devuelve este mismo payload como eco tras un `!` al confirmarlo, y **no cuenta
 /// repeticiones hasta recibirlo**. El framing de transporte (el `?` delante y el `\n` final) lo
-/// añade la capa de I/O. Ejemplo: banca, ROM 15, concéntrica → `"26115"` (se envía `?26115\n`).
+/// añade la capa de I/O. Ejemplo: banca, ROM 15, concéntrica → `"27115"` (se envía `?27115\n`).
 pub fn start_command(ex: ExerciseV1, rom_cm: u32, eccentric: bool) -> String {
     let phase = if eccentric { '1' } else { '2' };
-    format!("{phase}6{}{}", ex.code(), rom_cm)
+    format!("{phase}7{}{}", ex.code(), rom_cm)
 }
 
 /// Una repeticion decodificada.
@@ -138,12 +170,16 @@ mod tests {
 
     #[test]
     fn comando_arranque_formato() {
-        // Validado en vivo: banca ROM 15 concéntrica -> "26115" (se envía ?26115\n, eco !26115).
-        assert_eq!(start_command(ExerciseV1::Bench, 15, false), "26115");
+        // const '7' (no-tiempo-real): banca ROM 15 concéntrica -> "27115" (?27115\n, eco !27115).
+        // Validado en vivo 2026-06-26: 9 reps reales -> 9 concéntricas limpias vía sondeo de ?8.
+        assert_eq!(start_command(ExerciseV1::Bench, 15, false), "27115");
         // press militar ROM 50 concéntrica
-        assert_eq!(start_command(ExerciseV1::MilitaryPress, 50, false), "26450");
+        assert_eq!(start_command(ExerciseV1::MilitaryPress, 50, false), "27450");
         // peso muerto ROM 10 midiendo excéntrica -> E='1'
-        assert_eq!(start_command(ExerciseV1::Deadlift, 10, true), "16310");
+        assert_eq!(start_command(ExerciseV1::Deadlift, 10, true), "17310");
+        // modo ALL/test (X=9): existe pero reporta ambas fases (no se usa por defecto)
+        assert_eq!(start_command(ExerciseV1::Test, 10, false), "27910");
+        assert_eq!(start_command(ExerciseV1::Test, 20, true), "17920");
     }
 
     #[test]
@@ -154,5 +190,15 @@ mod tests {
         assert_eq!(ExerciseV1::from_name("DL"), Some(ExerciseV1::Deadlift));
         assert_eq!(ExerciseV1::from_name("press militar"), Some(ExerciseV1::MilitaryPress));
         assert_eq!(ExerciseV1::from_name("remo"), None);
+        // alias del modo ALL/test
+        assert_eq!(ExerciseV1::from_name("all"), Some(ExerciseV1::Test));
+        assert_eq!(ExerciseV1::from_name("TODO"), Some(ExerciseV1::Test));
+        assert_eq!(ExerciseV1::from_name("test"), Some(ExerciseV1::Test));
+    }
+
+    #[test]
+    fn etiquetas_de_modo() {
+        assert_eq!(ExerciseV1::Test.label(), "ALL (test)");
+        assert_eq!(ExerciseV1::Bench.label(), "press banca");
     }
 }

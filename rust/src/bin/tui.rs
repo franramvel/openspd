@@ -67,6 +67,8 @@ struct App {
     scanning: bool,
     scan_rx: Option<Receiver<Result<Vec<(String, String)>, String>>>,
     scan_results: Vec<(String, String)>,
+    // fase del encoder v1: false = concéntrica (por defecto), true = excéntrica
+    eccentric: bool,
     // multiusuario
     active_user: String,
     users: Vec<openspd_io::users::User>,
@@ -324,7 +326,7 @@ impl App {
         self.scan_rx = None;
         self.scan_results.clear();
         self.status = "elige un encoder".into();
-        self.msg = "Desconectado. Elige encoder: 'w' WiFi · 'e' escanear BLE · 'q' salir".into();
+        self.msg = "Desconectado. Elige encoder: 'w' WiFi · 'x' fase · 'e' escanear BLE · 'q' salir".into();
     }
 
     // ─────────────────────────── multiusuario ───────────────────────────
@@ -564,12 +566,13 @@ fn main() -> io::Result<()> {
         countdown_until: None,
         csv_path,
         profile_path,
-        msg: "Elige encoder: 'w' WiFi · 'e' escanear BLE · 'q' salir".into(),
+        msg: "Elige encoder: 'w' WiFi · 'x' fase · 'e' escanear BLE · 'q' salir".into(),
         quit: false,
         rx: None,
         scanning: false,
         scan_rx: None,
         scan_results: Vec::new(),
+        eccentric: false,
         active_user: user.slug,
         users,
         user_input: String::new(),
@@ -746,15 +749,17 @@ fn run<B: ratatui::backend::Backend>(
                             app.refresh_users();
                             app.user_screen = true;
                         }
+                        KeyCode::Char('x') => app.eccentric = !app.eccentric,
                         KeyCode::Char('w') => {
                             app.status = "conectando (v1 WiFi)…".into();
-                            // El v1 necesita el comando de arranque con el ejercicio para emitir reps.
-                            let mode = ExerciseV1::from_name(&app.exercise).unwrap_or(ExerciseV1::Test);
-                            let command = start_command(mode, DEFAULT_ROM_CM, false);
+                            // Modo del encoder = ejercicio elegido (fallback banca); fase = app.eccentric.
+                            // Modo no-tiempo-real (const 7) → concéntrica limpia vía sondeo de ?8.
+                            let mode = ExerciseV1::from_name(&app.exercise).unwrap_or(ExerciseV1::Bench);
+                            let command = start_command(mode, DEFAULT_ROM_CM, app.eccentric);
                             app.rx = Some(openspd_io::spawn_tcp_reader(
                                 ENCODER_HOST.to_string(),
                                 ENCODER_PORT,
-                                Some(command),
+                                command,
                             ));
                         }
                         KeyCode::Char('e') if !app.scanning => {
@@ -797,6 +802,19 @@ fn ui_select(f: &mut Frame, app: &App) {
         Span::raw(format!("{ENCODER_HOST}:{ENCODER_PORT}")),
         Span::raw(")"),
     ]));
+    lines.push(Line::from(vec![
+        Span::raw("     captura: "),
+        Span::styled(
+            ExerciseV1::from_name(&app.exercise).unwrap_or(ExerciseV1::Bench).label(),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw(" · fase "),
+        Span::styled(
+            if app.eccentric { "excéntrica" } else { "concéntrica" },
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ('x' cambia fase)", Style::default().fg(Color::DarkGray)),
+    ]));
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         Span::styled(" e ", Style::default().fg(Color::Black).bg(Color::Green)),
@@ -824,6 +842,8 @@ fn ui_select(f: &mut Frame, app: &App) {
     let help = Line::from(vec![
         Span::styled(" w ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" WiFi  "),
+        Span::styled(" x ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" fase  "),
         Span::styled(" e ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" escanear BLE  "),
         Span::styled(" 1-9 ", Style::default().fg(Color::Black).bg(Color::Gray)),
@@ -1250,6 +1270,7 @@ mod tests {
             scanning: false,
             scan_rx: None,
             scan_results: Vec::new(),
+            eccentric: false,
             active_user: "default".into(),
             users: Vec::new(),
             user_input: String::new(),
